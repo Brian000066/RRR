@@ -9,15 +9,16 @@ from generate_dags import DAGSpec, build_dag_specs, generate_multiple_dags
 #     python main.py
 # ============================================================
 
-NUM_DAGS = 5
+NUM_DAGS = 10
 RANDOM_SEED = 42
-OUTPUT_DIR = Path("generated_dags")
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "generated_dags"
 IMAGE_DPI = 180
 
 COMMON_DAG_SPEC = DAGSpec(
-    num_nodes=15,
-    depth=8,
-    max_width=10,
+    num_nodes=12,
+    depth=5,
+    max_width=5,
     edge_probability=0.2,
     allow_skip_edges=False,
     allow_early_branch_end=True,
