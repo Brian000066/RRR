@@ -1,0 +1,522 @@
+{
+  "graph": {
+    "graph_index": 4,
+    "num_nodes": 15,
+    "depth": 8,
+    "max_width": 10,
+    "edge_probability": 0.2,
+    "allow_skip_edges": false,
+    "allow_early_branch_end": true,
+    "single_source": true,
+    "single_sink": false,
+    "task_id": "task_4",
+    "task_name": "Task 4",
+    "deadline_seconds": 73,
+    "num_experts": 8,
+    "layer_widths": [
+      1,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2
+    ]
+  },
+  "nodes": [
+    {
+      "id": "v4_0",
+      "layer": 0,
+      "prompt": "Complete subtask v4_0 in layer 0.",
+      "output_key": "v4_0_output",
+      "required_data": {
+        "upstream_outputs": [],
+        "iot_features": [
+          5
+        ]
+      },
+      "gating_weights": [
+        0.095031,
+        0.176156,
+        0.061653,
+        0.114537,
+        0.137632,
+        0.114821,
+        0.132875,
+        0.167295
+      ]
+    },
+    {
+      "id": "v4_1",
+      "layer": 1,
+      "prompt": "Complete subtask v4_1 in layer 1.",
+      "output_key": "v4_1_output",
+      "required_data": {
+        "upstream_outputs": [
+          {
+            "source_node": "v4_0",
+            "output_key": "v4_0_output"
+          }
+        ],
+        "iot_features": [
+          0
+        ]
+      },
+      "gating_weights": [
+        0.17825,
+        0.068434,
+        0.135856,
+        0.032816,
+        0.271894,
+        0.13341,
+        0.073512,
+        0.105828
+      ]
+    },
+    {
+      "id": "v4_2",
+      "layer": 1,
+      "prompt": "Complete subtask v4_2 in layer 1.",
+      "output_key": "v4_2_output",
+      "required_data": {
+        "upstream_outputs": [
+          {
+            "source_node": "v4_0",
+            "output_key": "v4_0_output"
+          }
+        ],
+        "iot_features": [
+          0,
+          1,
+          4
+        ]
+      },
+      "gating_weights": [
+        0.232035,
+        0.026,
+        0.006176,
+        0.075032,
+        0.162916,
+        0.230461,
+        0.095404,
+        0.171976
+      ]
+    },
+    {
+      "id": "v4_3",
+      "layer": 2,
+      "prompt": "Complete subtask v4_3 in layer 2.",
+      "output_key": "v4_3_output",
+      "required_data": {
+        "upstream_outputs": [
+          {
+            "source_node": "v4_1",
+            "output_key": "v4_1_output"
+          }
+        ],
+        "iot_features": [
+          4
+        ]
+      },
+      "gating_weights": [
+        0.145459,
+        0.132111,
+        0.021463,
+        0.162701,
+        0.17909,
+        0.12646,
+        0.025497,
+        0.207219
+      ]
+    },
+    {
+      "id": "v4_4",
+      "layer": 2,
+      "prompt": "Complete subtask v4_4 in layer 2.",
+      "output_key": "v4_4_output",
+      "required_data": {
+        "upstream_outputs": [
+          {
+            "source_node": "v4_2",
+            "output_key": "v4_2_output"
+          }
+        ],
+        "iot_features": [
+          2
+        ]
+      },
+      "gating_weights": [
+        0.163059,
+        0.202473,
+        0.021106,
+        0.198195,
+        0.003872,
+        0.128568,
+        0.150037,
+        0.13269
+      ]
+    },
+    {
+      "id": "v4_5",
+      "layer": 3,
+      "prompt": "Complete subtask v4_5 in layer 3.",
+      "output_key": "v4_5_output",
+      "required_data": {
+        "upstream_outputs": [
+          {
+            "source_node": "v4_3",
+            "output_key": "v4_3_output"
+          }
+        ],
+        "iot_features": [
+          3,
+          5
+        ]
+      },
+      "gating_weights": [
+        0.143121,
+        0.088119,
+        0.148481,
+        0.19536,
+        0.05465,
+        0.163536,
+        0.108897,
+        0.097836
+      ]
+    },
+    {
+      "id": "v4_6",
+      "layer": 3,
+      "prompt": "Complete subtask v4_6 in layer 3.",
+      "output_key": "v4_6_output",
+      "required_data": {
+        "upstream_outputs": [
+          {
+            "source_node": "v4_4",
+            "output_key": "v4_4_output"
+          }
+        ],
+        "iot_features": [
+          4,
+          5
+        ]
+      },
+      "gating_weights": [
+        0.06333,
+        0.200969,
+        0.196018,
+        0.020449,
+        0.208028,
+        0.057542,
+        0.109652,
+        0.144012
+      ]
+    },
+    {
+      "id": "v4_7",
+      "layer": 4,
+      "prompt": "Complete subtask v4_7 in layer 4.",
+      "output_key": "v4_7_output",
+      "required_data": {
+        "upstream_outputs": [
+          {
+            "source_node": "v4_5",
+            "output_key": "v4_5_output"
+          }
+        ],
+        "iot_features": [
+          0,
+          2
+        ]
+      },
+      "gating_weights": [
+        0.13447,
+        0.088416,
+        0.132632,
+        0.096526,
+        0.070281,
+        0.076077,
+        0.162176,
+        0.239422
+      ]
+    },
+    {
+      "id": "v4_8",
+      "layer": 4,
+      "prompt": "Complete subtask v4_8 in layer 4.",
+      "output_key": "v4_8_output",
+      "required_data": {
+        "upstream_outputs": [
+          {
+            "source_node": "v4_6",
+            "output_key": "v4_6_output"
+          }
+        ],
+        "iot_features": [
+          0,
+          1,
+          4
+        ]
+      },
+      "gating_weights": [
+        0.018322,
+        0.154103,
+        0.10456,
+        0.162254,
+        0.147797,
+        0.138229,
+        0.10504,
+        0.169695
+      ]
+    },
+    {
+      "id": "v4_9",
+      "layer": 5,
+      "prompt": "Complete subtask v4_9 in layer 5.",
+      "output_key": "v4_9_output",
+      "required_data": {
+        "upstream_outputs": [
+          {
+            "source_node": "v4_7",
+            "output_key": "v4_7_output"
+          }
+        ],
+        "iot_features": [
+          2
+        ]
+      },
+      "gating_weights": [
+        0.055723,
+        0.173957,
+        0.076999,
+        0.146238,
+        0.119006,
+        0.133506,
+        0.106997,
+        0.187574
+      ]
+    },
+    {
+      "id": "v4_10",
+      "layer": 5,
+      "prompt": "Complete subtask v4_10 in layer 5.",
+      "output_key": "v4_10_output",
+      "required_data": {
+        "upstream_outputs": [
+          {
+            "source_node": "v4_8",
+            "output_key": "v4_8_output"
+          }
+        ],
+        "iot_features": [
+          2,
+          3
+        ]
+      },
+      "gating_weights": [
+        0.111108,
+        0.103105,
+        0.049483,
+        0.078982,
+        0.049032,
+        0.219768,
+        0.312588,
+        0.075934
+      ]
+    },
+    {
+      "id": "v4_11",
+      "layer": 6,
+      "prompt": "Complete subtask v4_11 in layer 6.",
+      "output_key": "v4_11_output",
+      "required_data": {
+        "upstream_outputs": [
+          {
+            "source_node": "v4_9",
+            "output_key": "v4_9_output"
+          }
+        ],
+        "iot_features": [
+          5
+        ]
+      },
+      "gating_weights": [
+        0.137746,
+        0.206132,
+        0.277828,
+        0.14925,
+        0.080508,
+        0.028598,
+        0.055223,
+        0.064715
+      ]
+    },
+    {
+      "id": "v4_12",
+      "layer": 6,
+      "prompt": "Complete subtask v4_12 in layer 6.",
+      "output_key": "v4_12_output",
+      "required_data": {
+        "upstream_outputs": [
+          {
+            "source_node": "v4_10",
+            "output_key": "v4_10_output"
+          }
+        ],
+        "iot_features": [
+          2
+        ]
+      },
+      "gating_weights": [
+        0.0035,
+        0.132133,
+        0.067858,
+        0.241019,
+        0.136888,
+        0.172525,
+        0.031239,
+        0.214838
+      ]
+    },
+    {
+      "id": "v4_13",
+      "layer": 7,
+      "prompt": "Complete subtask v4_13 in layer 7.",
+      "output_key": "v4_13_output",
+      "required_data": {
+        "upstream_outputs": [
+          {
+            "source_node": "v4_11",
+            "output_key": "v4_11_output"
+          }
+        ],
+        "iot_features": [
+          0,
+          5
+        ]
+      },
+      "gating_weights": [
+        0.144945,
+        0.118517,
+        0.111213,
+        0.04655,
+        0.012972,
+        0.237608,
+        0.120621,
+        0.207574
+      ]
+    },
+    {
+      "id": "v4_14",
+      "layer": 7,
+      "prompt": "Complete subtask v4_14 in layer 7.",
+      "output_key": "v4_14_output",
+      "required_data": {
+        "upstream_outputs": [
+          {
+            "source_node": "v4_11",
+            "output_key": "v4_11_output"
+          },
+          {
+            "source_node": "v4_12",
+            "output_key": "v4_12_output"
+          }
+        ],
+        "iot_features": [
+          0,
+          3
+        ]
+      },
+      "gating_weights": [
+        0.141882,
+        0.168789,
+        0.037308,
+        0.199449,
+        0.233377,
+        0.020945,
+        0.061027,
+        0.137223
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "source": "v4_0",
+      "target": "v4_1"
+    },
+    {
+      "source": "v4_0",
+      "target": "v4_2"
+    },
+    {
+      "source": "v4_1",
+      "target": "v4_3"
+    },
+    {
+      "source": "v4_2",
+      "target": "v4_4"
+    },
+    {
+      "source": "v4_3",
+      "target": "v4_5"
+    },
+    {
+      "source": "v4_4",
+      "target": "v4_6"
+    },
+    {
+      "source": "v4_5",
+      "target": "v4_7"
+    },
+    {
+      "source": "v4_6",
+      "target": "v4_8"
+    },
+    {
+      "source": "v4_7",
+      "target": "v4_9"
+    },
+    {
+      "source": "v4_8",
+      "target": "v4_10"
+    },
+    {
+      "source": "v4_9",
+      "target": "v4_11"
+    },
+    {
+      "source": "v4_10",
+      "target": "v4_12"
+    },
+    {
+      "source": "v4_11",
+      "target": "v4_13"
+    },
+    {
+      "source": "v4_11",
+      "target": "v4_14"
+    },
+    {
+      "source": "v4_12",
+      "target": "v4_14"
+    }
+  ],
+  "topological_order": [
+    "v4_0",
+    "v4_1",
+    "v4_2",
+    "v4_3",
+    "v4_4",
+    "v4_5",
+    "v4_6",
+    "v4_7",
+    "v4_8",
+    "v4_9",
+    "v4_10",
+    "v4_11",
+    "v4_12",
+    "v4_13",
+    "v4_14"
+  ]
+}
