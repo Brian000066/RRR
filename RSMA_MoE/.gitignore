@@ -1,0 +1,8 @@
+﻿__pycache__/
+*.pyc
+.DS_Store
+__MACOSX/
+.venv/
+.env
+generated_dags/
+results/

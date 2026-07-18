@@ -38,6 +38,8 @@ class DAGSpec:
     single_source: bool = True
     single_sink: bool = False
     exact_layer_widths: Optional[list[int]] = None
+    num_branches: Optional[int] = None
+    branch_length_range: Optional[tuple[int, int]] = None
 
 
 def build_dag_specs(num_dags: int, common_spec: DAGSpec) -> list[DAGSpec]:
@@ -57,6 +59,8 @@ def build_dag_specs(num_dags: int, common_spec: DAGSpec) -> list[DAGSpec]:
                 if common_spec.exact_layer_widths is not None
                 else None
             ),
+            num_branches=common_spec.num_branches,
+            branch_length_range=common_spec.branch_length_range,
         )
         for _ in range(num_dags)
     ]
@@ -175,6 +179,183 @@ def make_layered_nodes(
     return layers, node_to_layer
 
 
+
+def validate_branch_spec(spec: DAGSpec) -> None:
+    """Validate branch-based DAG settings."""
+    if spec.num_branches is None:
+        return
+    if spec.num_branches < 1:
+        raise ValueError("num_branches must be at least 1.")
+    if spec.num_nodes < spec.num_branches + 1:
+        raise ValueError(
+            "num_nodes must be at least num_branches + 1 when using "
+            "branch-based generation."
+        )
+
+    if spec.branch_length_range is not None:
+        min_length, max_length = spec.branch_length_range
+        if min_length < 1:
+            raise ValueError("branch_length_range min must be at least 1.")
+        if max_length < min_length:
+            raise ValueError("branch_length_range must be (min_length, max_length).")
+        min_total = 1 + spec.num_branches * min_length
+        max_total = 1 + spec.num_branches * max_length
+        if not min_total <= spec.num_nodes <= max_total:
+            raise ValueError(
+                f"num_nodes={spec.num_nodes} cannot fit "
+                f"num_branches={spec.num_branches} with "
+                f"branch_length_range={spec.branch_length_range}."
+            )
+
+
+def allocate_branch_lengths(spec: DAGSpec, rng: random.Random) -> list[int]:
+    """Allocate variable branch lengths while preserving total node count."""
+    validate_branch_spec(spec)
+    if spec.num_branches is None:
+        raise ValueError("num_branches is required for branch allocation.")
+
+    if spec.branch_length_range is None:
+        min_length = 1
+        max_length = spec.num_nodes - 1
+    else:
+        min_length, max_length = spec.branch_length_range
+
+    lengths = [min_length] * spec.num_branches
+    remaining = spec.num_nodes - 1 - sum(lengths)
+
+    while remaining > 0:
+        candidates = [
+            branch_index
+            for branch_index, length in enumerate(lengths)
+            if length < max_length
+        ]
+        if not candidates:
+            raise ValueError("Cannot allocate branch lengths with these settings.")
+        branch_index = rng.choice(candidates)
+        lengths[branch_index] += 1
+        remaining -= 1
+
+    return lengths
+
+
+def branch_layer_widths(branch_lengths: Sequence[int]) -> list[int]:
+    """Return layer widths for one source plus branch positions."""
+    max_length = max(branch_lengths)
+    return [1] + [
+        sum(length >= position for length in branch_lengths)
+        for position in range(1, max_length + 1)
+    ]
+
+
+def generate_branch_dag(
+    graph_index: int,
+    spec: DAGSpec,
+    rng: random.Random,
+    num_experts: int,
+    num_iot_features: int,
+    iot_features_per_node_range: tuple[int, int],
+    reconstruction_sigma: float,
+    reconstruction_error_range: tuple[float, float],
+    num_calibration_samples: int,
+    calibration_loss_range: tuple[float, float],
+    deadline_seconds: int,
+) -> nx.DiGraph:
+    """Generate one DAG with adjustable variable-length branches."""
+    validate_num_experts(num_experts)
+    branch_lengths = allocate_branch_lengths(spec, rng)
+    layer_widths = branch_layer_widths(branch_lengths)
+
+    graph = nx.DiGraph(
+        graph_index=graph_index,
+        generation_mode="branches",
+        num_nodes=spec.num_nodes,
+        num_branches=spec.num_branches,
+        branch_lengths=branch_lengths,
+        depth=len(layer_widths),
+        max_width=max(layer_widths),
+        edge_probability=spec.edge_probability,
+        allow_skip_edges=spec.allow_skip_edges,
+        allow_early_branch_end=True,
+        single_source=True,
+        single_sink=False,
+        task_id=f"task_{graph_index}",
+        task_name=f"Task {graph_index}",
+        deadline_seconds=deadline_seconds,
+        num_experts=num_experts,
+        layer_widths=layer_widths,
+    )
+
+    source = f"v{graph_index}_0"
+    graph.add_node(
+        source,
+        **make_node_attributes(
+            node_name=source,
+            layer=0,
+            num_experts=num_experts,
+            num_iot_features=num_iot_features,
+            iot_features_per_node_range=iot_features_per_node_range,
+            rng=rng,
+            reconstruction_sigma=reconstruction_sigma,
+            reconstruction_error_range=reconstruction_error_range,
+            num_calibration_samples=num_calibration_samples,
+            calibration_loss_range=calibration_loss_range,
+        ),
+    )
+    graph.nodes[source]["branch_id"] = -1
+    graph.nodes[source]["branch_position"] = 0
+
+    node_counter = 1
+    branches: list[list[str]] = []
+    for branch_id, branch_length in enumerate(branch_lengths):
+        branch_nodes: list[str] = []
+        previous_node = source
+        for branch_position in range(1, branch_length + 1):
+            node = f"v{graph_index}_{node_counter}"
+            node_counter += 1
+            graph.add_node(
+                node,
+                **make_node_attributes(
+                    node_name=node,
+                    layer=branch_position,
+                    num_experts=num_experts,
+                    num_iot_features=num_iot_features,
+                    iot_features_per_node_range=iot_features_per_node_range,
+                    rng=rng,
+                    reconstruction_sigma=reconstruction_sigma,
+                    reconstruction_error_range=reconstruction_error_range,
+                    num_calibration_samples=num_calibration_samples,
+                    calibration_loss_range=calibration_loss_range,
+                ),
+            )
+            graph.nodes[node]["branch_id"] = branch_id
+            graph.nodes[node]["branch_position"] = branch_position
+            graph.add_edge(previous_node, node)
+            previous_node = node
+            branch_nodes.append(node)
+        branches.append(branch_nodes)
+
+    for source_branch_id, source_branch in enumerate(branches):
+        for target_branch_id, target_branch in enumerate(branches):
+            if source_branch_id == target_branch_id:
+                continue
+            for source_node in source_branch:
+                source_position = int(graph.nodes[source_node]["branch_position"])
+                for target_node in target_branch:
+                    target_position = int(graph.nodes[target_node]["branch_position"])
+                    if target_position <= source_position:
+                        continue
+                    if graph.has_edge(source_node, target_node):
+                        continue
+                    if rng.random() < spec.edge_probability:
+                        graph.add_edge(source_node, target_node)
+
+    update_required_upstream_outputs(graph)
+
+    if not nx.is_directed_acyclic_graph(graph):
+        raise RuntimeError("Generated graph is not a DAG.")
+
+    return graph
+
 def generate_dag(
     graph_index: int,
     spec: DAGSpec,
@@ -182,9 +363,28 @@ def generate_dag(
     num_experts: int,
     num_iot_features: int,
     iot_features_per_node_range: tuple[int, int],
+    reconstruction_sigma: float,
+    reconstruction_error_range: tuple[float, float],
+    num_calibration_samples: int,
+    calibration_loss_range: tuple[float, float],
     deadline_seconds: int,
 ) -> nx.DiGraph:
-    """Generate one layered directed acyclic graph."""
+    """Generate one directed acyclic graph."""
+    if spec.num_branches is not None:
+        return generate_branch_dag(
+            graph_index=graph_index,
+            spec=spec,
+            rng=rng,
+            num_experts=num_experts,
+            num_iot_features=num_iot_features,
+            iot_features_per_node_range=iot_features_per_node_range,
+            reconstruction_sigma=reconstruction_sigma,
+            reconstruction_error_range=reconstruction_error_range,
+            num_calibration_samples=num_calibration_samples,
+            calibration_loss_range=calibration_loss_range,
+            deadline_seconds=deadline_seconds,
+        )
+
     validate_num_experts(num_experts)
     layer_widths = allocate_layer_widths(spec, rng)
     layers, node_to_layer = make_layered_nodes(
@@ -219,6 +419,10 @@ def generate_dag(
                 num_iot_features=num_iot_features,
                 iot_features_per_node_range=iot_features_per_node_range,
                 rng=rng,
+                reconstruction_sigma=reconstruction_sigma,
+                reconstruction_error_range=reconstruction_error_range,
+                num_calibration_samples=num_calibration_samples,
+                calibration_loss_range=calibration_loss_range,
             ),
         )
 
@@ -370,7 +574,13 @@ def generate_multiple_dags(
     num_experts: int = 1,
     num_iot_features: int = 1,
     iot_features_per_node_range: tuple[int, int] = (1, 1),
+    reconstruction_sigma: float = 1.0,
+    reconstruction_error_range: tuple[float, float] = (0.8, 1.5),
+    num_calibration_samples: int = 20,
+    calibration_loss_range: tuple[float, float] = (1.0, 4.0),
     task_deadline_seconds_range: tuple[int, int] = (60, 60),
+    verbose: bool = True,
+    export_artifacts: bool = True,
 ) -> list[nx.DiGraph]:
     """Generate and export multiple DAGs."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -390,9 +600,16 @@ def generate_multiple_dags(
             num_experts=num_experts,
             num_iot_features=num_iot_features,
             iot_features_per_node_range=iot_features_per_node_range,
+            reconstruction_sigma=reconstruction_sigma,
+            reconstruction_error_range=reconstruction_error_range,
+            num_calibration_samples=num_calibration_samples,
+            calibration_loss_range=calibration_loss_range,
             deadline_seconds=deadline_seconds,
         )
         graphs.append(graph)
+
+        if not export_artifacts:
+            continue
 
         image_path = output_dir / f"dag_{graph_index}.png"
         graphml_path = output_dir / f"dag_{graph_index}.graphml"
@@ -422,15 +639,23 @@ def generate_multiple_dags(
 
         save_dag_json(graph, json_path)
 
+        if not verbose:
+            continue
+
+        branch_info = ""
+        if graph.graph.get("generation_mode") == "branches":
+            branch_info = f", branch_lengths={graph.graph['branch_lengths']}"
         print(
             f"[DAG {graph_index}] "
             f"nodes={graph.number_of_nodes()}, "
             f"edges={graph.number_of_edges()}, "
             f"deadline_seconds={deadline_seconds}, "
             f"layer_widths={graph.graph['layer_widths']}"
+            f"{branch_info}"
         )
         print(f"  PNG:     {image_path}")
         print(f"  GraphML: {graphml_path}")
         print(f"  JSON:    {json_path}")
 
     return graphs
+

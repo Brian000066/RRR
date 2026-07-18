@@ -18,6 +18,11 @@ def make_gating_weights(num_experts: int, rng: random.Random) -> list[float]:
     return weights
 
 
+def make_expert_confidence(num_experts: int, rng: random.Random) -> list[float]:
+    """Create pi(subtask|expert), the confidence of each expert for a node."""
+    return [round(rng.uniform(0.55, 0.98), 6) for _ in range(num_experts)]
+
+
 def make_iot_features(
     rng: random.Random,
     num_iot_features: int,
@@ -43,6 +48,42 @@ def make_iot_features(
     return sorted(rng.sample(range(num_iot_features), feature_count))
 
 
+def make_reconstruction_errors(
+    feature_count: int,
+    error_range: tuple[float, float],
+    rng: random.Random,
+) -> list[float]:
+    """Create equal per-feature reconstruction errors for one node."""
+    low, high = error_range
+    if low < 0 or high < low:
+        raise ValueError("reconstruction_error_range must be non-negative (min, max).")
+    shared_error = round(rng.uniform(low, high), 6)
+    return [shared_error for _ in range(feature_count)]
+def compute_reconstruction_loss(
+    reconstruction_errors: list[float],
+    sigma: float,
+) -> float:
+    """Compute L_rec = 1/(2 sigma^2) * sum_k ||error_k||^2."""
+    if sigma <= 0:
+        raise ValueError("reconstruction_sigma must be positive.")
+    squared_error = sum(error * error for error in reconstruction_errors)
+    return round(squared_error / (2.0 * sigma * sigma), 6)
+
+
+def make_calibration_losses(
+    num_samples: int,
+    loss_range: tuple[float, float],
+    rng: random.Random,
+) -> list[float]:
+    """Create D_cal node loss samples used to estimate q_hat."""
+    if num_samples < 0:
+        raise ValueError("num_calibration_samples cannot be negative.")
+    low, high = loss_range
+    if low < 0 or high < low:
+        raise ValueError("calibration_loss_range must be non-negative (min, max).")
+    return [round(rng.uniform(low, high), 6) for _ in range(num_samples)]
+
+
 def make_node_attributes(
     node_name: str,
     layer: int,
@@ -50,21 +91,43 @@ def make_node_attributes(
     num_iot_features: int,
     iot_features_per_node_range: tuple[int, int],
     rng: random.Random,
+    reconstruction_sigma: float = 1.0,
+    reconstruction_error_range: tuple[float, float] = (0.8, 1.5),
+    num_calibration_samples: int = 20,
+    calibration_loss_range: tuple[float, float] = (1.0, 4.0),
 ) -> dict[str, object]:
     """Create task-oriented attributes for one node."""
+    iot_features = make_iot_features(
+        rng=rng,
+        num_iot_features=num_iot_features,
+        iot_features_per_node_range=iot_features_per_node_range,
+    )
+    reconstruction_errors = make_reconstruction_errors(
+        feature_count=len(iot_features),
+        error_range=reconstruction_error_range,
+        rng=rng,
+    )
+
     return {
         "layer": layer,
         "prompt": f"Complete subtask {node_name} in layer {layer}.",
         "output_key": f"{node_name}_output",
         "required_data": {
             "upstream_outputs": [],
-            "iot_features": make_iot_features(
-                rng=rng,
-                num_iot_features=num_iot_features,
-                iot_features_per_node_range=iot_features_per_node_range,
-            ),
+            "iot_features": iot_features,
         },
         "gating_weights": make_gating_weights(num_experts, rng),
+        "expert_confidence": make_expert_confidence(num_experts, rng),
+        "reconstruction_errors": reconstruction_errors,
+        "reconstruction_loss": compute_reconstruction_loss(
+            reconstruction_errors,
+            reconstruction_sigma,
+        ),
+        "calibration_losses": make_calibration_losses(
+            num_samples=num_calibration_samples,
+            loss_range=calibration_loss_range,
+            rng=rng,
+        ),
     }
 
 
@@ -108,3 +171,4 @@ def make_task_deadline_seconds(
         )
 
     return rng.randint(min_seconds, max_seconds)
+
