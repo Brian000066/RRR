@@ -70,6 +70,7 @@ class ChainedPipelineResult:
 
 class ChainedComparisonPipeline:
     allow_expert_loss_repair: bool = True
+    activate_all_candidate_groups: bool = True
 
     def __init__(
         self,
@@ -102,15 +103,25 @@ class ChainedComparisonPipeline:
     def run(self) -> ChainedPipelineResult:
         assignments, selected_prob, selected_experts, activated, used_memory = self._assign_topk_experts()
         candidate_features = self._candidate_server_features(assignments)
-        candidate_groups = self._build_distance_groups(candidate_features, select_groups=False)
-        active_groups, subtask_features, required_prob, rec_loss, perf_loss = self._repair_loss_with_groups(
-            assignments,
-            selected_prob,
-            selected_experts,
-            candidate_groups,
-            activated,
-            used_memory,
-        )
+        candidate_groups = self._build_distance_groups(candidate_features)
+        if self.activate_all_candidate_groups:
+            active_groups, subtask_features, required_prob, rec_loss, perf_loss = self._use_all_candidate_groups(
+                assignments,
+                selected_prob,
+                selected_experts,
+                candidate_groups,
+                activated,
+                used_memory,
+            )
+        else:
+            active_groups, subtask_features, required_prob, rec_loss, perf_loss = self._repair_loss_with_groups(
+                assignments,
+                selected_prob,
+                selected_experts,
+                candidate_groups,
+                activated,
+                used_memory,
+            )
         data_req = self._subtask_data_requirements(assignments, subtask_features)
         server_features = self._server_required_features(data_req)
         feature_to_groups = self._feature_to_groups(active_groups)
@@ -142,6 +153,58 @@ class ChainedComparisonPipeline:
             violations=violations,
             evaluation=evaluation,
         )
+    def _use_all_candidate_groups(
+        self,
+        assignments,
+        selected_probability,
+        selected_experts_by_key,
+        candidate_groups,
+        activated,
+        used_memory,
+    ):
+        active_groups = list(candidate_groups)
+        active_feature_coverage: Set[str] = set()
+        for group in active_groups:
+            active_feature_coverage.update(group.required_features)
+        subtask_features: Dict[AssignmentKey, Set[str]] = {}
+        required_probability: Dict[str, float] = {}
+        reconstruction_loss: Dict[str, float] = {}
+        performance_loss: Dict[str, float] = {}
+
+        for task in self.tasks.values():
+            for subtask in task.subtasks:
+                key = (task.id, subtask.id)
+                label = self._assignment_label(key)
+                selected_features = set(subtask.required_features) & active_feature_coverage
+                probability = selected_probability.get(label, 0.0)
+                threshold = self.evaluator.conformal_loss_threshold(subtask)
+                loss = self.evaluator.performance_loss_from_probability(subtask, probability, selected_features)
+
+                while self.allow_expert_loss_repair and loss > threshold + 1e-12:
+                    selected_experts = selected_experts_by_key.setdefault(key, set())
+                    candidate = self._best_repair_candidate(subtask, selected_experts, activated, used_memory)
+                    if candidate is None:
+                        break
+                    server_id, expert_id = candidate
+                    pairs = assignments.setdefault(key, [])
+                    if not self._append_unique_assignment(pairs, server_id, expert_id):
+                        break
+                    selected_experts.add(expert_id)
+                    self._activate(server_id, expert_id, activated, used_memory)
+                    probability += self.evaluator.expert_contribution(subtask, expert_id)
+                    selected_probability[label] = probability
+                    loss = self.evaluator.performance_loss_from_probability(subtask, probability, selected_features)
+
+                if loss > threshold + 1e-12:
+                    self.scheduler_violations.append(
+                        f"Loss repair: {key} loss {loss:.6g} > threshold {threshold:.6g}"
+                    )
+                subtask_features[key] = selected_features
+                required_probability[label] = self.evaluator.required_selection_probability(subtask, selected_features)
+                reconstruction_loss[label] = self.evaluator.reconstruction_loss_for_features(subtask, selected_features)
+                performance_loss[label] = loss
+
+        return active_groups, subtask_features, required_probability, reconstruction_loss, performance_loss
     @staticmethod
     def _append_unique_assignment(
         pairs: List[Tuple[ServerId, ExpertId]],
@@ -437,7 +500,7 @@ class ChainedComparisonPipeline:
                 required.setdefault(server_id, set()).update(features)
         return required
 
-    def _build_distance_groups(self, server_required_features, select_groups=True):
+    def _build_distance_groups(self, server_required_features):
         groups: List[GroupSpec] = []
         for server_id in self.servers:
             assigned_required = set(server_required_features.get(server_id, set()))
@@ -464,10 +527,7 @@ class ChainedComparisonPipeline:
                                 required_features,
                             )
                         )
-            if select_groups:
-                groups.extend(self._select_groups_for_required_features(candidate_groups, local_required))
-            else:
-                groups.extend(candidate_groups)
+            groups.extend(candidate_groups)
             self._record_local_missing_features(server_id, local_required, groups)
         return groups
 
@@ -481,28 +541,6 @@ class ChainedComparisonPipeline:
         for device_id in device_ids:
             features.update(self.devices[device_id].features & local_required)
         return features
-
-    def _select_groups_for_required_features(self, candidate_groups, required_features):
-        selected = []
-        missing = set(required_features)
-        unused = list(candidate_groups)
-        while missing and unused:
-            best = max(
-                unused,
-                key=lambda group: (
-                    len(group.required_features & missing),
-                    -len(group.devices),
-                    group.server_id,
-                    group.id,
-                ),
-            )
-            covered = best.required_features & missing
-            if not covered:
-                break
-            selected.append(best)
-            missing -= covered
-            unused.remove(best)
-        return selected
 
     def _record_local_missing_features(self, server_id, local_required, groups):
         available = set()
@@ -695,7 +733,7 @@ class ChainedComparisonPipeline:
 
     def _derive_bandwidth_for_budget(self, group, budget):
         if not group.devices or not group.required_features:
-            return self.config.min_bandwidth
+            return 0.0
         return self.evaluator.derive_group_bandwidth_for_budget(group, budget)
 
     def _feature_to_groups(self, groups):
@@ -830,18 +868,16 @@ def run_chained_pipeline(
     top_k: int = 2,
     num_servers: int = 9,
     num_iot_devices: int = 100,
-    features_per_device_range: tuple[int, int] = (2, 6),
-    connected_servers_per_device: int | None = None,
+    features_per_device_range: tuple[int, int] = (5, 12),
+    server_feature_overlap_ratio: float = 0.25,
+    global_random_feature_fraction: float = 0.15,
     experts_per_server: int = 4,
     server_gpu_memory: float = 8192.0,
-    default_wired_rate: float = 1e9,
     wired_rate_range: tuple[float, float] | None = None,
     c_bw: float = 1e-3,
     c_act: float = 1.0,
     c_fwd: float = 1.0,
-    uplink_time_budget: float | None = None,
     bandwidth_time_fraction: float = 1.0,
-    min_bandwidth: float = 0.0,
     default_feature_bits: float = 12000.0,
     wavelength: float = 0.125,
     noise_power: float = 1e-18,
@@ -850,13 +886,14 @@ def run_chained_pipeline(
     area_size: float = 1000.0,
     cell_radius: float = 300.0,
     num_antennas: int = 4,
-    beamforming_correlation_weight: float = 0.0,
     loss_threshold: float | None = None,
     lambda_reconstruction: float = 0.1,
     calibration_alpha: float = 0.1,
     reconstruction_sigma: float = 1.0,
     random_seed: int = 42,
-    max_group_size: int = 4,
+    max_group_size: int = 5,
+    min_rate: float = 1.0,
+    gssgd_beamforming_gain_threshold: float = 0.0,
     rank_by: str = "gating",
     clusters_per_server: Optional[int] = None,
     kmeans_iterations: int = 20,
@@ -869,7 +906,6 @@ def run_chained_pipeline(
         experts=experts,
         experts_per_server=experts_per_server,
         gpu_memory=server_gpu_memory,
-        default_wired_rate=default_wired_rate,
         wired_rate_range=wired_rate_range,
         rng=rng,
     )
@@ -878,7 +914,8 @@ def run_chained_pipeline(
         num_iot_devices=num_iot_devices,
         num_servers=num_servers,
         features_per_device_range=features_per_device_range,
-        connected_servers_per_device=connected_servers_per_device,
+        server_feature_overlap_ratio=server_feature_overlap_ratio,
+        global_random_feature_fraction=global_random_feature_fraction,
         area_size=area_size,
         cell_radius=cell_radius,
         num_antennas=num_antennas,
@@ -896,18 +933,16 @@ def run_chained_pipeline(
         kmeans_iterations=kmeans_iterations,
         config=FormulationConfig(
             max_group_size=max_group_size,
+            min_rate=min_rate,
+            gssgd_beamforming_gain_threshold=gssgd_beamforming_gain_threshold,
             c_bw=c_bw,
             c_act=c_act,
             c_fwd=c_fwd,
             derive_bandwidth=True,
-            uplink_time_budget=uplink_time_budget,
             bandwidth_time_fraction=bandwidth_time_fraction,
-            min_bandwidth=min_bandwidth,
-            default_wired_rate=default_wired_rate,
             noise_power=noise_power,
             common_power_ratio=common_power_ratio,
             default_power=max_device_power,
-            beamforming_correlation_weight=beamforming_correlation_weight,
             default_loss_threshold=loss_threshold if loss_threshold is not None else 3.0,
             lambda_reconstruction=lambda_reconstruction,
             calibration_alpha=calibration_alpha,
@@ -939,15 +974,11 @@ def run_chained_pipeline(
             "num_servers": num_servers,
             "num_iot_devices": num_iot_devices,
             "features_per_device_range": features_per_device_range,
-            "connected_servers_per_device": connected_servers_per_device,
             "experts_per_server": experts_per_server,
             "server_gpu_memory": server_gpu_memory,
-            "default_wired_rate": default_wired_rate,
             "wired_rate_range": wired_rate_range,
             "bandwidth_mode": "derived_by_group_slack",
-            "uplink_time_budget": uplink_time_budget,
             "bandwidth_time_fraction": bandwidth_time_fraction,
-            "min_bandwidth": min_bandwidth,
             "default_feature_bits": default_feature_bits,
             "wavelength": wavelength,
             "noise_power": noise_power,
@@ -956,8 +987,9 @@ def run_chained_pipeline(
             "area_size": area_size,
             "cell_radius": cell_radius,
             "num_antennas": num_antennas,
-            "beamforming_correlation_weight": beamforming_correlation_weight,
             "max_group_size": max_group_size,
+            "min_rate": min_rate,
+            "distance_group_selection_mode": "all_candidate_groups_transmit",
             "loss_threshold": loss_threshold,
             "lambda_reconstruction": lambda_reconstruction,
             "calibration_alpha": calibration_alpha,

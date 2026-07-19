@@ -3,8 +3,9 @@
 Pipeline:
 1. Top-K MoE selects experts and servers for each subtask.
 2. GSSGD DBG phase 1-3 builds local IoT groups under each server.
-3. The existing loss-repair/backhaul logic selects groups and routes them.
-4. The shared formulation evaluator computes timing, constraints, and cost.
+3. GSSGD-selected groups transmit from the beginning of the task timeline.
+4. Backhaul routes selected group data when the assigned server needs it.
+5. The shared formulation evaluator computes timing, constraints, and cost.
 
 Only DBG is kept from the original GSSGD/SIoT baseline. DCG/collaborative
 computing code is intentionally not used here.
@@ -41,9 +42,9 @@ from utils.formulation import FormulationConfig, GroupSpec, ServerId  # noqa: E4
 
 class HybridTopKGSSGDBackhaulPipeline(ChainedComparisonPipeline):
     """Hybrid-shaped pipeline whose IoT grouping stage is GSSGD DBG."""
+    activate_all_candidate_groups = True
 
-    def _build_distance_groups(self, server_required_features, select_groups=True):
-        del select_groups
+    def _build_distance_groups(self, server_required_features):
         groups: list[GroupSpec] = []
         for server_id in self.servers:
             assigned_required = set(server_required_features.get(server_id, set()))
@@ -66,6 +67,7 @@ class HybridTopKGSSGDBackhaulPipeline(ChainedComparisonPipeline):
                 selected_device_ids=selected,
                 required_features=local_required,
                 max_group_size=self.config.max_group_size,
+                beamforming_gain_threshold=self.config.gssgd_beamforming_gain_threshold,
             )
             refined_groups = phase3_dbg_refinement(
                 devices=self.devices,
@@ -74,6 +76,7 @@ class HybridTopKGSSGDBackhaulPipeline(ChainedComparisonPipeline):
                 groups=raw_groups,
                 unselected_device_ids=unselected,
                 required_features=local_required,
+                beamforming_gain_threshold=self.config.gssgd_beamforming_gain_threshold,
             )
 
             for members in refined_groups:
@@ -107,7 +110,7 @@ def result_to_jsonable(
         payload["network_model"].setdefault("gssgd_parameters", {})
         payload["network_model"]["gssgd_parameters"].update(
             {
-                "pipeline": "Top-K expert placement + GSSGD DBG IoT grouping + backhaul repair",
+                "pipeline": "Top-K expert placement + GSSGD DBG IoT grouping + backhaul routing",
                 "dbg_only": True,
                 "dcg_removed": True,
                 "grouping_rule": "phase-aware DBG grouping using common feature ratio and beamforming gain",
@@ -124,18 +127,16 @@ def run_hybrid_topk_gssgd_backhaul(
     top_k: int = 2,
     num_servers: int = 9,
     num_iot_devices: int = 100,
-    features_per_device_range: tuple[int, int] = (2, 6),
-    connected_servers_per_device: int | None = None,
+    features_per_device_range: tuple[int, int] = (5, 12),
+    server_feature_overlap_ratio: float = 0.25,
+    global_random_feature_fraction: float = 0.15,
     experts_per_server: int = 4,
     server_gpu_memory: float = 8192.0,
-    default_wired_rate: float = 1e9,
     wired_rate_range: tuple[float, float] | None = None,
     c_bw: float = 1e-3,
     c_act: float = 1.0,
     c_fwd: float = 1.0,
-    uplink_time_budget: float | None = None,
     bandwidth_time_fraction: float = 1.0,
-    min_bandwidth: float = 0.0,
     default_feature_bits: float = 12000.0,
     wavelength: float = 0.125,
     noise_power: float = 1e-18,
@@ -144,13 +145,14 @@ def run_hybrid_topk_gssgd_backhaul(
     area_size: float = 1000.0,
     cell_radius: float = 300.0,
     num_antennas: int = 4,
-    beamforming_correlation_weight: float = 0.0,
     loss_threshold: float | None = None,
     lambda_reconstruction: float = 0.1,
     calibration_alpha: float = 0.1,
     reconstruction_sigma: float = 1.0,
     random_seed: int = 42,
-    max_group_size: int = 4,
+    max_group_size: int = 5,
+    min_rate: float = 1.0,
+    gssgd_beamforming_gain_threshold: float = 0.0,
     rank_by: str = "gating",
     clusters_per_server: Optional[int] = None,
     kmeans_iterations: int = 20,
@@ -164,7 +166,6 @@ def run_hybrid_topk_gssgd_backhaul(
         experts=experts,
         experts_per_server=experts_per_server,
         gpu_memory=server_gpu_memory,
-        default_wired_rate=default_wired_rate,
         wired_rate_range=wired_rate_range,
         rng=rng,
     )
@@ -173,7 +174,8 @@ def run_hybrid_topk_gssgd_backhaul(
         num_iot_devices=num_iot_devices,
         num_servers=num_servers,
         features_per_device_range=features_per_device_range,
-        connected_servers_per_device=connected_servers_per_device,
+        server_feature_overlap_ratio=server_feature_overlap_ratio,
+        global_random_feature_fraction=global_random_feature_fraction,
         area_size=area_size,
         cell_radius=cell_radius,
         num_antennas=num_antennas,
@@ -190,18 +192,16 @@ def run_hybrid_topk_gssgd_backhaul(
         rank_by=rank_by,
         config=FormulationConfig(
             max_group_size=max_group_size,
+            min_rate=min_rate,
+            gssgd_beamforming_gain_threshold=gssgd_beamforming_gain_threshold,
             c_bw=c_bw,
             c_act=c_act,
             c_fwd=c_fwd,
             derive_bandwidth=True,
-            uplink_time_budget=uplink_time_budget,
             bandwidth_time_fraction=bandwidth_time_fraction,
-            min_bandwidth=min_bandwidth,
-            default_wired_rate=default_wired_rate,
             noise_power=noise_power,
             common_power_ratio=common_power_ratio,
             default_power=max_device_power,
-            beamforming_correlation_weight=beamforming_correlation_weight,
             default_loss_threshold=loss_threshold if loss_threshold is not None else 3.0,
             lambda_reconstruction=lambda_reconstruction,
             calibration_alpha=calibration_alpha,
@@ -224,20 +224,17 @@ def run_hybrid_topk_gssgd_backhaul(
             "dbg_only": True,
             "dcg_removed": True,
             "max_group_size": max_group_size,
+            "beamforming_gain_threshold": gssgd_beamforming_gain_threshold,
         },
         "rsma_parameters": {
             "num_servers": num_servers,
             "num_iot_devices": num_iot_devices,
             "features_per_device_range": features_per_device_range,
-            "connected_servers_per_device": connected_servers_per_device,
             "experts_per_server": experts_per_server,
             "server_gpu_memory": server_gpu_memory,
-            "default_wired_rate": default_wired_rate,
             "wired_rate_range": wired_rate_range,
             "bandwidth_mode": "derived_by_group_slack",
-            "uplink_time_budget": uplink_time_budget,
             "bandwidth_time_fraction": bandwidth_time_fraction,
-            "min_bandwidth": min_bandwidth,
             "default_feature_bits": default_feature_bits,
             "wavelength": wavelength,
             "noise_power": noise_power,
@@ -246,7 +243,7 @@ def run_hybrid_topk_gssgd_backhaul(
             "area_size": area_size,
             "cell_radius": cell_radius,
             "num_antennas": num_antennas,
-            "beamforming_correlation_weight": beamforming_correlation_weight,
+            "min_rate": min_rate,
             "loss_threshold": loss_threshold,
             "lambda_reconstruction": lambda_reconstruction,
             "calibration_alpha": calibration_alpha,

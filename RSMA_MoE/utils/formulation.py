@@ -85,18 +85,15 @@ class FormulationConfig:
     c_bw: float = 1e-3
     c_act: float = 1.0
     c_fwd: float = 1.0
-    default_wired_rate: float = 1e9
     derive_bandwidth: bool = True
-    uplink_time_budget: Optional[float] = None
     bandwidth_time_fraction: float = 1.0
-    min_bandwidth: float = 0.0
     default_channel_gain: float = 1.0
     default_power: float = 1.0
     common_power_ratio: float = 0.6
-    beamforming_correlation_weight: float = 0.0
     noise_power: float = 1e-18
     wavelength: float = 0.125
     max_group_size: int = 4
+    gssgd_beamforming_gain_threshold: float = 0.0
     min_rate: float = 1.0
     output_token_bits: float = 16.0
     default_feature_bits: float = 12_000.0
@@ -211,6 +208,39 @@ def normalize_experts(experts: Mapping[str, Any]) -> Dict[ExpertId, ExpertSpec]:
             latency=float(_first(data, ("latency", "inference_latency", "tau"), 1.0)),
         )
     return normalized
+
+
+def siot_rate_mapping(sinr: float) -> float:
+    """SIoT MCS-to-rate mapping copied from SIoT_Algo/config.py."""
+    if sinr <= -9.478:
+        return 0.5
+    if sinr <= -6.658:
+        return 1.2
+    if sinr <= -4.098:
+        return 2.4
+    if sinr <= -1.798:
+        return 3.5
+    if sinr <= 0.399:
+        return 4.2
+    if sinr <= 2.424:
+        return 5.1
+    if sinr <= 4.489:
+        return 6.0
+    if sinr <= 6.367:
+        return 7.6
+    if sinr <= 8.456:
+        return 8.8
+    if sinr <= 10.266:
+        return 9.5
+    if sinr <= 12.218:
+        return 10.2
+    if sinr <= 14.122:
+        return 20.4
+    if sinr <= 15.849:
+        return 30.3
+    if sinr <= 17.786:
+        return 40.0
+    return 50.0
 
 
 def normalize_servers(servers: Iterable[Any]) -> Dict[ServerId, ServerSpec]:
@@ -383,8 +413,6 @@ class FormulationEvaluator:
         ]
 
     def bandwidth_time_budget(self) -> float:
-        if self.config.uplink_time_budget is not None:
-            return max(float(self.config.uplink_time_budget), 1e-12)
         finite_deadlines = [
             task.deadline
             for task in self.tasks.values()
@@ -400,10 +428,6 @@ class FormulationEvaluator:
         assignments: Mapping[AssignmentKey, Sequence[Tuple[ServerId, ExpertId]]],
         backhaul: Set[Tuple[ServerId, GroupId, ServerId]],
     ) -> Dict[Tuple[ServerId, GroupId], float]:
-        if self.config.uplink_time_budget is not None:
-            fixed_budget = self.bandwidth_time_budget()
-            return {(group.server_id, group.id): fixed_budget for group in groups}
-
         dependencies = self.group_dependencies(groups, assignments, backhaul)
         downstream = self.downstream_compute_times(assignments)
         fallback = self.bandwidth_time_budget()
@@ -524,7 +548,7 @@ class FormulationEvaluator:
         )
         db_gain = self.distributed_beamforming_gain(group)
         common_sinr = db_gain * common_signal / (private_interference + self.config.noise_power)
-        common_efficiency = log2(1.0 + common_sinr)
+        common_efficiency = siot_rate_mapping(common_sinr)
 
         private_efficiencies: Dict[DeviceId, float] = {}
         for device_id in group.devices:
@@ -540,7 +564,7 @@ class FormulationEvaluator:
                     * self.spatial_correlation(device_id, other_id, group.server_id)
                 )
             private_sinr = signal / (interference + self.config.noise_power)
-            private_efficiencies[device_id] = log2(1.0 + private_sinr)
+            private_efficiencies[device_id] = siot_rate_mapping(private_sinr)
         return common_efficiency, private_efficiencies
 
     def derive_group_bandwidth(self, group: GroupSpec) -> float:
@@ -561,7 +585,7 @@ class FormulationEvaluator:
             efficiency = max(private_efficiencies.get(device_id, 0.0), 1e-12)
             private_required = max(private_required, private_volume / (budget * efficiency))
 
-        return max(self.config.min_bandwidth, common_required, private_required)
+        return max(common_required, private_required)
 
     def compute_rates(
         self, groups: Sequence[GroupSpec]
@@ -706,21 +730,51 @@ class FormulationEvaluator:
                         f"starts {start_time:.6g} before predecessors ready {predecessor_ready:.6g}"
                     )
 
-        for group in groups:
-            common = common_rates.get((group.server_id, group.id), 0.0)
-            if self.group_common_volume(group) > 0.0 and common < self.config.min_rate:
-                violations.append(f"C7 min common rate: group {(group.server_id, group.id)} {common:.6g} < {self.config.min_rate:.6g}")
-            for device_id in group.devices:
-                rate = private_rates.get((group.server_id, group.id, device_id), 0.0)
-                if rate < self.config.min_rate:
-                    violations.append(f"C7 min private rate: device {device_id} in group {(group.server_id, group.id)} {rate:.6g} < {self.config.min_rate:.6g}")
+        violations.extend(self.check_minimum_transmission_rate(groups, common_rates, private_rates))
 
+        return violations
+
+    def check_minimum_transmission_rate(
+        self,
+        groups: Sequence[GroupSpec],
+        common_rates: Mapping[Tuple[ServerId, GroupId], float],
+        private_rates: Mapping[Tuple[ServerId, GroupId, DeviceId], float],
+    ) -> List[str]:
+        """C7: minimum common/private transmission rate constraint.
+
+        B(n,g)=1 exactly when n is a member of group g. Non-members have
+        B(n,g)=0 and therefore do not need a private-rate check.
+        """
+        violations: List[str] = []
+        r_min = max(float(self.config.min_rate), 0.0)
+        if r_min <= 0.0:
+            return violations
+
+        for group in groups:
+            group_key = (group.server_id, group.id)
+            common_rate = common_rates.get(group_key, 0.0)
+            if self.group_common_volume(group) > 0.0:
+                for device_id in group.devices:
+                    if common_rate < r_min:
+                        violations.append(
+                            f"C7 min common rate: device {device_id} in group {group_key} "
+                            f"{common_rate:.6g} < {r_min:.6g}"
+                        )
+            for device_id in group.devices:
+                private_rate = private_rates.get((group.server_id, group.id, device_id), 0.0)
+                membership_indicator = 1.0
+                required_private_rate = membership_indicator * r_min
+                if private_rate < required_private_rate:
+                    violations.append(
+                        f"C7 min private rate: device {device_id} in group {group_key} "
+                        f"{private_rate:.6g} < {required_private_rate:.6g}"
+                    )
         return violations
 
     def wired_rate(self, src: ServerId, dst: ServerId) -> float:
         if src == dst:
             return float("inf")
-        return self.servers.get(src, ServerSpec(src, 0)).wired_rates.get(dst, self.config.default_wired_rate)
+        return self.servers.get(src, ServerSpec(src, 0)).wired_rates.get(dst, 1e9)
 
     def channel_gain(self, device_id: DeviceId, server_id: ServerId) -> float:
         vector = self.devices[device_id].channel_vector.get(server_id, tuple())
@@ -785,10 +839,8 @@ class FormulationEvaluator:
             return 0.0
         return abs(sum(weighted_terms)) / denominator
     def effective_channel_gain(self, device_id: DeviceId, server_id: ServerId, group: GroupSpec) -> float:
-        base_gain = self.channel_gain(device_id, server_id)
-        avg_corr = self.average_group_correlation(device_id, server_id, group)
-        factor = 1.0 / ((1.0 + self.config.beamforming_correlation_weight * avg_corr) ** 0.5)
-        return base_gain * factor
+        del group
+        return self.channel_gain(device_id, server_id)
 
     def db_gain(self, device_id: DeviceId, server_id: ServerId) -> float:
         device = self.devices[device_id]

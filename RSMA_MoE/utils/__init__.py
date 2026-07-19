@@ -1,1 +1,1 @@
-﻿# Package marker for shared formulation utilities.
+# Package marker for shared formulation utilities.

@@ -1,4 +1,4 @@
-﻿"""GSSGD phase 1 adapted to this project: CCM + SPCCM selection.
+"""GSSGD phase 1 adapted to this project: CCM + SPCCM selection.
 
 This keeps the original GSSGD selection idea and only maps SIoT locations to
 this project's IoT feature indexes. DCG logic is not included.

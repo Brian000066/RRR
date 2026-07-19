@@ -15,7 +15,7 @@ def phase3_dbg_refinement(
     groups: Sequence[Sequence[DeviceId]],
     unselected_device_ids: Iterable[DeviceId],
     required_features: Set[str],
-    gamma_threshold: float = 0.8,
+    beamforming_gain_threshold: float = 0.0,
 ) -> List[Tuple[DeviceId, ...]]:
     """Run SIoT elimination/replacement for DBG groups while preserving coverage."""
     refined = [list(group) for group in groups if group]
@@ -28,7 +28,6 @@ def phase3_dbg_refinement(
         groups=refined,
         required_features=required_features,
         target_coverage=target_coverage,
-        gamma_threshold=gamma_threshold,
     )
     _replace_devices(
         devices=devices,
@@ -38,7 +37,7 @@ def phase3_dbg_refinement(
         unselected=sorted(set(unselected_device_ids), key=_id_sort_key),
         required_features=required_features,
         target_coverage=target_coverage,
-        gamma_threshold=gamma_threshold,
+        beamforming_gain_threshold=beamforming_gain_threshold,
     )
     return [tuple(group) for group in refined if group and _group_features(devices, group, required_features)]
 
@@ -50,7 +49,6 @@ def _eliminate_redundant_devices(
     groups: List[List[DeviceId]],
     required_features: Set[str],
     target_coverage: Set[str],
-    gamma_threshold: float,
 ) -> None:
     all_devices = sorted({device_id for group in groups for device_id in group}, key=lambda d: len(devices[d].features))
     for device_id in all_devices:
@@ -61,8 +59,6 @@ def _eliminate_redundant_devices(
         if not _groups_features(devices, groups, required_features).issuperset(target_coverage):
             owner.append(device_id)
             continue
-        if not _group_db_valid(devices, evaluator, server_id, owner, gamma_threshold, required_features):
-            owner.append(device_id)
 
 
 def _replace_devices(
@@ -73,7 +69,7 @@ def _replace_devices(
     unselected: List[DeviceId],
     required_features: Set[str],
     target_coverage: Set[str],
-    gamma_threshold: float,
+    beamforming_gain_threshold: float,
 ) -> None:
     for group in groups:
         if not group:
@@ -81,7 +77,7 @@ def _replace_devices(
         improved = True
         while improved:
             improved = False
-            current_ratio = _common_message_ratio(devices, group, required_features)
+            current_ratio = _common_message_ratio(devices, group, set())
             current_cost = _group_rsma_cost(devices, evaluator, server_id, group, required_features)
             best = None
             for candidate in list(unselected):
@@ -94,9 +90,9 @@ def _replace_devices(
                         proposed.append(candidate)
                         if not _groups_coverage_after_replacement(devices, groups, group, proposed, required_features).issuperset(target_coverage):
                             continue
-                        if not _group_db_valid(devices, evaluator, server_id, proposed, gamma_threshold, required_features):
+                        if _beamforming_gain(evaluator, server_id, proposed) < beamforming_gain_threshold:
                             continue
-                        new_ratio = _common_message_ratio(devices, proposed, required_features)
+                        new_ratio = _common_message_ratio(devices, proposed, set())
                         if new_ratio <= current_ratio:
                             continue
                         new_cost = _group_rsma_cost(devices, evaluator, server_id, proposed, required_features)
@@ -111,6 +107,22 @@ def _replace_devices(
                 unselected.remove(candidate)
                 unselected.extend(replaced)
                 improved = True
+
+
+
+def _beamforming_gain(
+    evaluator: FormulationEvaluator,
+    server_id: ServerId,
+    group: Sequence[DeviceId],
+) -> float:
+    spec = GroupSpec(
+        server_id=server_id,
+        id="ser_db_candidate",
+        devices=tuple(group),
+        bandwidth=0.0,
+        required_features=set(),
+    )
+    return evaluator.distributed_beamforming_gain(spec)
 
 
 def _group_rsma_cost(
@@ -151,31 +163,6 @@ def _groups_coverage_after_replacement(
         coverage.update(_group_features(devices, source, required_features))
     return coverage
 
-
-def _group_db_valid(
-    devices: dict[DeviceId, DeviceSpec],
-    evaluator: FormulationEvaluator,
-    server_id: ServerId,
-    group: Sequence[DeviceId],
-    gamma_threshold: float,
-    required_features: Set[str],
-) -> bool:
-    if len(group) <= 1:
-        return True
-    common_ratio = _common_message_ratio(devices, group, set())
-    if common_ratio <= 0.0:
-        return False
-    numerator = 0j
-    denominator = 0.0
-    for device_id in group:
-        device = devices[device_id]
-        gain = abs(evaluator.channel_gain(device_id, server_id))
-        weight = (max(device.max_power * common_ratio, 0.0) ** 0.5) * gain
-        numerator += weight * evaluator.db_phase_term(device_id, server_id)
-        denominator += weight
-    if denominator <= 0.0:
-        return False
-    return abs(numerator) / denominator >= gamma_threshold
 
 
 def _common_message_ratio(

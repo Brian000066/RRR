@@ -1,4 +1,4 @@
-﻿"""Hybrid comparison method entry points."""
+"""Hybrid comparison method entry points."""
 
 from compared_method.hybrid_topk_distance_backhaul import run_chained_pipeline as run_hybrid_topk_distance_backhaul
 from compared_method.hybrid_topk_gssgd_backhaul import run_hybrid_topk_gssgd_backhaul

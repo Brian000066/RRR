@@ -35,18 +35,12 @@ from utils.formulation import AssignmentKey, ExpertId, FormulationConfig, Server
 
 
 class WDMoEExpertSelectionMixin:
-    """DAG-aware WDMoE expert selection.
+    """DAG-aware WDMoE expert selection adapted to per-subtask loss bounds.
 
-    For each task graph, this follows the user-defined WDMoE-based flow:
-    1. Run ordinary Top-K on all nodes and compute graph-level baseline WLR.
-    2. Set theta = alpha.
-    3. Re-run the whole graph with the current theta.
-    4. For each node, build a full expert latency vector where latency is
-       predecessor forwarding time plus expert inference time.
-    5. Select Top-K by gating score. If cosine(G, latency) <= theta, remove the
-       lower-gating expert from the selected set.
-    6. Stop when current WLR / baseline WLR > gamma; otherwise increase theta
-       and rebuild the graph selection from scratch.
+    Each DAG node first builds the ordinary Top-K baseline and a full expert
+    latency vector. If cosine(G, latency) is below the WDMoE threshold, the
+    lowest-gating selected expert is pruned once. The prune is kept only when
+    the node-level WLR ratio remains above the configured target.
     """
 
     allow_expert_loss_repair: bool = False
@@ -226,103 +220,6 @@ class WDMoEExpertSelectionMixin:
         if not values:
             return 0.0
         return sum(values) / len(values)
-    def _wdmoe_build_task_assignments(
-        self,
-        task,
-        committed_assignments,
-        activated_snapshot,
-        used_memory_snapshot,
-        threshold: Optional[float],
-    ):
-        task_assignments: Dict[AssignmentKey, list[tuple[ServerId, ExpertId]]] = {}
-        selected_by_key: Dict[AssignmentKey, Set[ExpertId]] = {}
-        tentative_activated = {sid: set(eids) for sid, eids in activated_snapshot.items()}
-        tentative_memory = dict(used_memory_snapshot)
-
-        for subtask in self._topological_subtasks(task):
-            key = (task.id, subtask.id)
-            latency_vector = self._wdmoe_latency_vector(
-                task=task,
-                subtask=subtask,
-                committed_assignments=committed_assignments,
-                task_assignments=task_assignments,
-                activated=tentative_activated,
-                used_memory=tentative_memory,
-            )
-            selected_experts = set(self._top_k_experts(subtask)[: self.top_k])
-            if not selected_experts:
-                selected_experts = set(self._fallback_top_experts(subtask, count=1))
-
-            if threshold is not None and len(selected_experts) > 1:
-                similarity = self._wdmoe_weight_latency_similarity(subtask, latency_vector)
-                if similarity <= threshold:
-                    dropped = min(
-                        selected_experts,
-                        key=lambda expert_id: (self._expert_score(subtask, expert_id), expert_id),
-                    )
-                    selected_experts.remove(dropped)
-
-            pairs: list[tuple[ServerId, ExpertId]] = []
-            feasible_experts: Set[ExpertId] = set()
-            ordered_experts = sorted(selected_experts, key=lambda eid: (-self._expert_score(subtask, eid), eid))
-            for expert_id in ordered_experts:
-                server_id = self._best_server_for_expert_with_predecessors(
-                    expert_id=expert_id,
-                    task=task,
-                    subtask=subtask,
-                    committed_assignments=committed_assignments,
-                    task_assignments=task_assignments,
-                    activated=tentative_activated,
-                    used_memory=tentative_memory,
-                )
-                if server_id is None:
-                    self.scheduler_violations.append(f"WDMoE placement: no feasible server stores {expert_id} for {key}")
-                    continue
-                if not self._append_unique_assignment(pairs, server_id, expert_id):
-                    continue
-                feasible_experts.add(expert_id)
-                self._activate(server_id, expert_id, tentative_activated, tentative_memory)
-
-            if not pairs:
-                fallback = self._best_repair_candidate(subtask, set(), tentative_activated, tentative_memory)
-                if fallback is not None:
-                    server_id, expert_id = fallback
-                    if self._append_unique_assignment(pairs, server_id, expert_id):
-                        feasible_experts.add(expert_id)
-                        self._activate(server_id, expert_id, tentative_activated, tentative_memory)
-
-            task_assignments[key] = pairs
-            selected_by_key[key] = feasible_experts
-
-        wlr = self._wdmoe_graph_wlr(task, task_assignments, committed_assignments)
-        return task_assignments, selected_by_key, wlr
-
-    def _wdmoe_graph_wlr(self, task, task_assignments, committed_assignments) -> float:
-        values = []
-        merged = dict(committed_assignments)
-        merged.update(task_assignments)
-        finish_cache: Dict[tuple[AssignmentKey, ServerId], float] = {}
-
-        for subtask in self._topological_subtasks(task):
-            key = (task.id, subtask.id)
-            for server_id, expert_id in task_assignments.get(key, []):
-                pred_forward = self._wdmoe_predecessor_forwarding_time(
-                    task=task,
-                    subtask=subtask,
-                    target_server=server_id,
-                    assignments=merged,
-                    finish_cache=finish_cache,
-                )
-                latency = pred_forward + self.experts[expert_id].latency
-                values.append(self._expert_weight(subtask, expert_id) / max(latency, 1e-12))
-                finish_cache[(key, server_id)] = max(
-                    finish_cache.get((key, server_id), 0.0),
-                    latency,
-                )
-        if not values:
-            return 0.0
-        return sum(values) / len(values)
-
     def _wdmoe_latency_vector(
         self,
         task,
@@ -460,18 +357,16 @@ def _run_wdmoe_pipeline(
     top_k: int = 2,
     num_servers: int = 9,
     num_iot_devices: int = 100,
-    features_per_device_range: tuple[int, int] = (2, 6),
-    connected_servers_per_device: int | None = None,
+    features_per_device_range: tuple[int, int] = (5, 12),
+    server_feature_overlap_ratio: float = 0.25,
+    global_random_feature_fraction: float = 0.15,
     experts_per_server: int = 4,
     server_gpu_memory: float = 8192.0,
-    default_wired_rate: float = 1e9,
     wired_rate_range: tuple[float, float] | None = None,
     c_bw: float = 1e-3,
     c_act: float = 1.0,
     c_fwd: float = 1.0,
-    uplink_time_budget: float | None = None,
     bandwidth_time_fraction: float = 1.0,
-    min_bandwidth: float = 0.0,
     default_feature_bits: float = 12000.0,
     wavelength: float = 0.125,
     noise_power: float = 1e-18,
@@ -480,13 +375,14 @@ def _run_wdmoe_pipeline(
     area_size: float = 1000.0,
     cell_radius: float = 300.0,
     num_antennas: int = 4,
-    beamforming_correlation_weight: float = 0.0,
     loss_threshold: float | None = None,
     lambda_reconstruction: float = 0.1,
     calibration_alpha: float = 0.1,
     reconstruction_sigma: float = 1.0,
     random_seed: int = 42,
-    max_group_size: int = 4,
+    max_group_size: int = 5,
+    min_rate: float = 1.0,
+    gssgd_beamforming_gain_threshold: float = 0.0,
     rank_by: str = "gating",
     clusters_per_server: Optional[int] = None,
     kmeans_iterations: int = 20,
@@ -503,7 +399,6 @@ def _run_wdmoe_pipeline(
         experts=experts,
         experts_per_server=experts_per_server,
         gpu_memory=server_gpu_memory,
-        default_wired_rate=default_wired_rate,
         wired_rate_range=wired_rate_range,
         rng=rng,
     )
@@ -512,7 +407,8 @@ def _run_wdmoe_pipeline(
         num_iot_devices=num_iot_devices,
         num_servers=num_servers,
         features_per_device_range=features_per_device_range,
-        connected_servers_per_device=connected_servers_per_device,
+        server_feature_overlap_ratio=server_feature_overlap_ratio,
+        global_random_feature_fraction=global_random_feature_fraction,
         area_size=area_size,
         cell_radius=cell_radius,
         num_antennas=num_antennas,
@@ -530,18 +426,16 @@ def _run_wdmoe_pipeline(
         kmeans_iterations=kmeans_iterations,
         config=FormulationConfig(
             max_group_size=max_group_size,
+            min_rate=min_rate,
+            gssgd_beamforming_gain_threshold=gssgd_beamforming_gain_threshold,
             c_bw=c_bw,
             c_act=c_act,
             c_fwd=c_fwd,
             derive_bandwidth=True,
-            uplink_time_budget=uplink_time_budget,
             bandwidth_time_fraction=bandwidth_time_fraction,
-            min_bandwidth=min_bandwidth,
-            default_wired_rate=default_wired_rate,
             noise_power=noise_power,
             common_power_ratio=common_power_ratio,
             default_power=max_device_power,
-            beamforming_correlation_weight=beamforming_correlation_weight,
             default_loss_threshold=loss_threshold if loss_threshold is not None else 3.0,
             lambda_reconstruction=lambda_reconstruction,
             calibration_alpha=calibration_alpha,
@@ -585,15 +479,11 @@ def _run_wdmoe_pipeline(
             "num_servers": num_servers,
             "num_iot_devices": num_iot_devices,
             "features_per_device_range": features_per_device_range,
-            "connected_servers_per_device": connected_servers_per_device,
             "experts_per_server": experts_per_server,
             "server_gpu_memory": server_gpu_memory,
-            "default_wired_rate": default_wired_rate,
             "wired_rate_range": wired_rate_range,
             "bandwidth_mode": "derived_by_group_slack",
-            "uplink_time_budget": uplink_time_budget,
             "bandwidth_time_fraction": bandwidth_time_fraction,
-            "min_bandwidth": min_bandwidth,
             "default_feature_bits": default_feature_bits,
             "wavelength": wavelength,
             "noise_power": noise_power,
@@ -602,8 +492,9 @@ def _run_wdmoe_pipeline(
             "area_size": area_size,
             "cell_radius": cell_radius,
             "num_antennas": num_antennas,
-            "beamforming_correlation_weight": beamforming_correlation_weight,
             "max_group_size": max_group_size,
+            "min_rate": min_rate,
+            "gssgd_beamforming_gain_threshold": gssgd_beamforming_gain_threshold,
             "loss_threshold": loss_threshold,
             "lambda_reconstruction": lambda_reconstruction,
             "calibration_alpha": calibration_alpha,

@@ -1,14 +1,14 @@
 """GSSGD phase 2 adapted to this project: DBG grouping only.
 
 The original algorithm separates DCG and DBG. This file keeps only DBG:
-SPCI ordering + distributed beamforming constraint + RSMA group-size constraint.
+SPCI ordering + RSMA group-size + distributed beamforming gain constraints.
 """
 
 from __future__ import annotations
 
 from typing import Iterable, List, Sequence, Set, Tuple
 
-from utils.formulation import DeviceId, DeviceSpec, FormulationEvaluator, ServerId
+from utils.formulation import DeviceId, DeviceSpec, FormulationEvaluator, GroupSpec, ServerId
 
 
 def phase2_dbg_grouping(
@@ -18,7 +18,7 @@ def phase2_dbg_grouping(
     selected_device_ids: Iterable[DeviceId],
     required_features: Set[str],
     max_group_size: int,
-    gamma_threshold: float = 0.8,
+    beamforming_gain_threshold: float = 0.0,
 ) -> List[Tuple[DeviceId, ...]]:
     """Group selected SIoTs into DBG/RSMA groups."""
     unassigned = sorted(set(selected_device_ids), key=_id_sort_key)
@@ -43,27 +43,22 @@ def phase2_dbg_grouping(
 
             selected = None
             target_group = None
+            best_score = None
             for candidate in ranked:
                 for existing_group in groups:
-                    if (
-                        _check_distributed_beamforming_constraint(
-                            devices,
-                            evaluator,
-                            server_id,
-                            existing_group,
-                            candidate,
-                            gamma_threshold,
-                            required_features,
-                        )
-                        and len(existing_group) + 1 <= max(1, max_group_size)
-                    ):
+                    if len(existing_group) + 1 > max(1, max_group_size):
+                        continue
+                    proposed = [*existing_group, candidate]
+                    if _beamforming_gain(evaluator, server_id, proposed) < beamforming_gain_threshold:
+                        continue
+                    score = _spci(devices, evaluator, server_id, candidate, existing_group, required_features)
+                    item = (score, len(devices[candidate].features & required_features), str(candidate))
+                    if best_score is None or item > best_score:
+                        best_score = item
                         selected = candidate
                         target_group = existing_group
-                        break
-                if selected is not None:
-                    break
 
-            if selected is None:
+            if selected is None or best_score[0] <= 0.0:
                 new_seed = ranked[0]
                 groups.append([new_seed])
                 unassigned.remove(new_seed)
@@ -120,37 +115,20 @@ def _spci(
     return spatial_phase * common_ratio
 
 
-def _check_distributed_beamforming_constraint(
-    devices: dict[DeviceId, DeviceSpec],
+
+def _beamforming_gain(
     evaluator: FormulationEvaluator,
     server_id: ServerId,
-    group: Sequence[DeviceId],
-    candidate: DeviceId | None,
-    gamma_threshold: float,
-    required_features: Set[str],
-) -> bool:
-    proposed = list(group)
-    if candidate is not None:
-        proposed.append(candidate)
-    if not proposed:
-        return False
-
-    common_ratio = _common_message_ratio(devices, proposed, set())
-    if common_ratio <= 0.0:
-        return False
-
-    numerator = 0j
-    denominator = 0.0
-    for device_id in proposed:
-        device = devices[device_id]
-        gain = abs(evaluator.channel_gain(device_id, server_id))
-        weight = (max(device.max_power * common_ratio, 0.0) ** 0.5) * gain
-        numerator += weight * evaluator.db_phase_term(device_id, server_id)
-        denominator += weight
-    if denominator <= 0.0:
-        return False
-    gamma = abs(numerator) / denominator
-    return gamma >= gamma_threshold
+    device_ids: Sequence[DeviceId],
+) -> float:
+    spec = GroupSpec(
+        server_id=server_id,
+        id="dbg_candidate",
+        devices=tuple(device_ids),
+        bandwidth=0.0,
+        required_features=set(),
+    )
+    return evaluator.distributed_beamforming_gain(spec)
 
 
 def _common_message_ratio(
