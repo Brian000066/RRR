@@ -26,6 +26,7 @@ from compared_method.hybrid_topk_distance_backhaul import (  # noqa: E402
 )
 from compared_method.hybrid_topk_gssgd_backhaul import HybridTopKGSSGDBackhaulPipeline  # noqa: E402
 from rsma_integration import (  # noqa: E402
+    build_feature_bits,
     build_simple_devices,
     build_simple_experts,
     build_simple_servers,
@@ -165,12 +166,28 @@ class WDMoEExpertSelectionMixin:
             current_wlr = baseline_wlr
             current_ratio = 1.0
 
+        if attempted_pruning and candidate_experts != baseline_experts:
+            candidate_probability = self.evaluator.selection_probability(subtask, candidate_experts)
+            full_features = set(subtask.required_features)
+            candidate_loss = self.evaluator.performance_loss_from_probability(
+                subtask,
+                candidate_probability,
+                full_features,
+            )
+            loss_threshold = self.evaluator.conformal_loss_threshold(subtask)
+            if candidate_loss > loss_threshold + 1e-12:
+                candidate_experts = set(baseline_experts)
+                current_wlr = baseline_wlr
+                current_ratio = 1.0
+                met_gamma = False
+
         best_experts = candidate_experts
         best_wlr = current_wlr
         best_theta = threshold
 
         pairs: list[tuple[ServerId, ExpertId]] = []
         feasible_experts: Set[ExpertId] = set()
+        target_count = len(best_experts)
         ordered_experts = sorted(best_experts, key=lambda eid: (-self._expert_score(subtask, eid), eid))
         for expert_id in ordered_experts:
             server_id = self._best_server_for_expert_with_predecessors(
@@ -183,20 +200,64 @@ class WDMoEExpertSelectionMixin:
                 used_memory=used_memory,
             )
             if server_id is None:
-                self.scheduler_violations.append(f"WDMoE placement: no feasible server stores {expert_id} for {key}")
                 continue
             if not self._append_unique_assignment(pairs, server_id, expert_id):
                 continue
             feasible_experts.add(expert_id)
             self._activate(server_id, expert_id, activated, used_memory)
 
-        if not pairs:
-            fallback = self._best_repair_candidate(subtask, set(), activated, used_memory)
-            if fallback is not None:
+        while len(pairs) < target_count:
+            fallback = self._best_wdmoe_loss_repair_candidate(
+                task=task,
+                subtask=subtask,
+                selected_experts=feasible_experts,
+                committed_assignments=committed_assignments,
+                task_assignments=task_assignments,
+                activated=activated,
+                used_memory=used_memory,
+            )
+            if fallback is None:
+                break
+            server_id, expert_id = fallback
+            if not self._append_unique_assignment(pairs, server_id, expert_id):
+                break
+            feasible_experts.add(expert_id)
+            self._activate(server_id, expert_id, activated, used_memory)
+
+        if len(pairs) < target_count:
+            self.scheduler_violations.append(
+                f"WDMoE placement: only {len(pairs)} feasible experts for {key}; target {target_count}"
+            )
+
+        if attempted_pruning and len(feasible_experts) < self.top_k:
+            full_features = set(subtask.required_features)
+            loss_threshold = self.evaluator.conformal_loss_threshold(subtask)
+            probability = self.evaluator.selection_probability(subtask, feasible_experts)
+            loss = self.evaluator.performance_loss_from_probability(subtask, probability, full_features)
+            while loss > loss_threshold + 1e-12 and len(feasible_experts) < self.top_k:
+                fallback = self._best_wdmoe_loss_repair_candidate(
+                task=task,
+                subtask=subtask,
+                selected_experts=feasible_experts,
+                committed_assignments=committed_assignments,
+                task_assignments=task_assignments,
+                activated=activated,
+                used_memory=used_memory,
+            )
+                if fallback is None:
+                    break
                 server_id, expert_id = fallback
-                if self._append_unique_assignment(pairs, server_id, expert_id):
-                    feasible_experts.add(expert_id)
-                    self._activate(server_id, expert_id, activated, used_memory)
+                if not self._append_unique_assignment(pairs, server_id, expert_id):
+                    break
+                feasible_experts.add(expert_id)
+                self._activate(server_id, expert_id, activated, used_memory)
+                probability = self.evaluator.selection_probability(subtask, feasible_experts)
+                loss = self.evaluator.performance_loss_from_probability(subtask, probability, full_features)
+            if len(feasible_experts) > len(best_experts):
+                best_experts = set(feasible_experts)
+                best_wlr = self._wdmoe_subtask_wlr(subtask, best_experts, latency_vector)
+                current_ratio = best_wlr / max(baseline_wlr, 1e-12)
+                met_gamma = False
 
         metrics = {
             "baseline_wlr": baseline_wlr,
@@ -207,6 +268,7 @@ class WDMoEExpertSelectionMixin:
             "met_gamma": met_gamma,
             "attempted_pruning": attempted_pruning,
             "pruned": len(best_experts) < len(baseline_experts),
+            "loss_feasible_after_pruning": not (attempted_pruning and len(best_experts) < len(baseline_experts)),
             "baseline_expert_count": len(baseline_experts),
             "selected_expert_count": len(feasible_experts),
         }
@@ -291,6 +353,40 @@ class WDMoEExpertSelectionMixin:
                 best = (score, server_id)
         return None if best is None else best[1]
 
+    def _best_wdmoe_loss_repair_candidate(
+        self,
+        task,
+        subtask,
+        selected_experts,
+        committed_assignments,
+        task_assignments,
+        activated,
+        used_memory,
+    ):
+        merged = dict(committed_assignments)
+        merged.update(task_assignments)
+        best = None
+        for server_id, server in self.servers.items():
+            for expert_id in server.stored_experts:
+                if expert_id in selected_experts:
+                    continue
+                contribution = self.evaluator.expert_contribution(subtask, expert_id)
+                if contribution <= 0.0:
+                    continue
+                expert = self.experts[expert_id]
+                memory_after = used_memory.get(server_id, 0.0)
+                activation_penalty = 0.0
+                if expert_id not in activated.get(server_id, set()):
+                    memory_after += expert.memory
+                    activation_penalty = self.config.c_act
+                if memory_after > server.gpu_memory:
+                    continue
+                pred_forward = self._wdmoe_predecessor_forwarding_time(task, subtask, server_id, merged, {})
+                score = (-contribution, activation_penalty, pred_forward + expert.latency, server_id, expert_id)
+                if best is None or score < best[0]:
+                    best = (score, server_id, expert_id)
+        return None if best is None else (best[1], best[2])
+
     def _wdmoe_predecessor_forwarding_time(self, task, subtask, target_server, assignments, finish_cache) -> float:
         ready = 0.0
         subtask_map = {item.id: item for item in task.subtasks}
@@ -354,6 +450,8 @@ def _run_wdmoe_pipeline(
     output_path: Path,
     num_experts: int,
     num_iot_features: int,
+    expert_memory_range: tuple[float, float] | None = None,
+    feature_bits_range: tuple[float, float] | None = None,
     top_k: int = 2,
     num_servers: int = 9,
     num_iot_devices: int = 100,
@@ -362,6 +460,7 @@ def _run_wdmoe_pipeline(
     global_random_feature_fraction: float = 0.15,
     experts_per_server: int = 4,
     server_gpu_memory: float = 8192.0,
+    server_gpu_memory_range: tuple[float, float] | None = None,
     wired_rate_range: tuple[float, float] | None = None,
     c_bw: float = 1e-3,
     c_act: float = 1.0,
@@ -393,12 +492,14 @@ def _run_wdmoe_pipeline(
 ) -> ChainedPipelineResult:
     rng = random.Random(random_seed)
     tasks = graphs_to_tasks(graphs, loss_threshold)
-    experts = build_simple_experts(num_experts)
+    feature_bits_by_name = build_feature_bits(num_iot_features, default_feature_bits, feature_bits_range, rng)
+    experts = build_simple_experts(num_experts, memory_range=expert_memory_range, rng=rng)
     servers = build_simple_servers(
         num_servers=num_servers,
         experts=experts,
         experts_per_server=experts_per_server,
         gpu_memory=server_gpu_memory,
+        gpu_memory_range=server_gpu_memory_range,
         wired_rate_range=wired_rate_range,
         rng=rng,
     )
@@ -436,11 +537,12 @@ def _run_wdmoe_pipeline(
             noise_power=noise_power,
             common_power_ratio=common_power_ratio,
             default_power=max_device_power,
+            default_feature_bits=default_feature_bits,
+            feature_bits_by_name=feature_bits_by_name,
             default_loss_threshold=loss_threshold if loss_threshold is not None else 3.0,
             lambda_reconstruction=lambda_reconstruction,
             calibration_alpha=calibration_alpha,
             reconstruction_sigma=reconstruction_sigma,
-            default_feature_bits=default_feature_bits,
             wavelength=wavelength,
         ),
     )
@@ -479,12 +581,15 @@ def _run_wdmoe_pipeline(
             "num_servers": num_servers,
             "num_iot_devices": num_iot_devices,
             "features_per_device_range": features_per_device_range,
+            "expert_memory_range": expert_memory_range,
             "experts_per_server": experts_per_server,
-            "server_gpu_memory": server_gpu_memory,
+            "server_gpu_memory_range": server_gpu_memory_range,
             "wired_rate_range": wired_rate_range,
             "bandwidth_mode": "derived_by_group_slack",
             "bandwidth_time_fraction": bandwidth_time_fraction,
             "default_feature_bits": default_feature_bits,
+            "feature_bits_range": feature_bits_range,
+            "feature_bits_by_name": feature_bits_by_name,
             "wavelength": wavelength,
             "noise_power": noise_power,
             "common_power_ratio": common_power_ratio,

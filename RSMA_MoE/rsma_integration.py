@@ -26,6 +26,30 @@ def feature_name(feature_index: int | str) -> str:
 def expert_id(expert_index: int | str) -> str:
     return f"expert_{expert_index}"
 
+def build_feature_bits(
+    num_iot_features: int,
+    default_feature_bits: float,
+    feature_bits_range: tuple[float, float] | None = None,
+    rng: random.Random | None = None,
+) -> dict[str, float]:
+    if num_iot_features < 1:
+        return {}
+    rng = rng or random.Random()
+    if feature_bits_range is None:
+        low = high = float(default_feature_bits)
+    else:
+        low, high = feature_bits_range
+        low = float(low)
+        high = float(high)
+        if low <= 0.0 or high <= 0.0:
+            raise ValueError("feature_bits_range values must be positive.")
+        if low > high:
+            low, high = high, low
+    return {
+        feature_name(index): (low if low == high else rng.uniform(low, high))
+        for index in range(num_iot_features)
+    }
+
 
 def node_to_subtask(
     node_id: str,
@@ -149,16 +173,39 @@ def load_tasks_from_generated_dir(
     ]
 
 
-def build_simple_experts(num_experts: int) -> dict[str, dict[str, float | int]]:
-    """Create indexed experts."""
+def normalize_float_range(
+    value_range: tuple[float, float] | None,
+    default: tuple[float, float],
+    label: str,
+) -> tuple[float, float]:
+    low, high = value_range or default
+    low = float(low)
+    high = float(high)
+    if low <= 0.0 or high <= 0.0:
+        raise ValueError(f"{label} values must be positive.")
+    if low > high:
+        low, high = high, low
+    return low, high
+
+
+def build_simple_experts(
+    num_experts: int,
+    memory_range: tuple[float, float] | None = None,
+    rng: random.Random | None = None,
+) -> dict[str, dict[str, float | int]]:
+    """Create indexed experts with heterogeneous model sizes."""
     if num_experts < 1:
         raise ValueError("num_experts must be at least 1.")
 
+    rng = rng or random.Random()
+    memory_min, memory_max = normalize_float_range(memory_range, (256.0, 256.0), "expert_memory_range")
+
     experts: dict[str, dict[str, float | int]] = {}
     for index in range(num_experts):
+        memory = memory_min if memory_min == memory_max else rng.uniform(memory_min, memory_max)
         experts[expert_id(index)] = {
             "index": index,
-            "memory": 256.0,
+            "memory": memory,
             "latency": 0.05 + index * 0.01,
         }
     return experts
@@ -169,6 +216,7 @@ def build_simple_servers(
     experts: Mapping[str, Mapping[str, Any]],
     experts_per_server: int,
     gpu_memory: float = 8192.0,
+    gpu_memory_range: tuple[float, float] | None = None,
     wired_rate_range: tuple[float, float] | None = None,
     rng: random.Random | None = None,
 ) -> list[dict[str, Any]]:
@@ -197,6 +245,7 @@ def build_simple_servers(
                 break
 
     rng = rng or random.Random()
+    gpu_min, gpu_max = normalize_float_range(gpu_memory_range, (gpu_memory, gpu_memory), "server_gpu_memory_range")
     rate_min, rate_max = wired_rate_range or (1e9, 1e9)
     if rate_min <= 0.0 or rate_max <= 0.0:
         raise ValueError("wired rates must be positive.")
@@ -205,10 +254,11 @@ def build_simple_servers(
 
     servers: list[dict[str, Any]] = []
     for server_index, stored in enumerate(experts_by_server):
+        server_gpu_memory = gpu_min if gpu_min == gpu_max else rng.uniform(gpu_min, gpu_max)
         servers.append(
             {
                 "id": f"server_{server_index}",
-                "gpu_memory": gpu_memory,
+                "gpu_memory": server_gpu_memory,
                 "stored_experts": stored,
                 "active_experts": [],
                 "wired_rates": {
@@ -628,6 +678,8 @@ def run_rsma_scheduler(
     output_path: Path,
     num_experts: int,
     num_iot_features: int,
+    expert_memory_range: tuple[float, float] | None = None,
+    feature_bits_range: tuple[float, float] | None = None,
     num_servers: int = 9,
     num_iot_devices: int = 100,
     features_per_device_range: tuple[int, int] = (5, 12),
@@ -635,6 +687,7 @@ def run_rsma_scheduler(
     global_random_feature_fraction: float = 0.15,
     experts_per_server: int = 4,
     server_gpu_memory: float = 8192.0,
+    server_gpu_memory_range: tuple[float, float] | None = None,
     wired_rate_range: tuple[float, float] | None = None,
     c_bw: float = 1e-3,
     c_act: float = 1.0,
@@ -659,12 +712,14 @@ def run_rsma_scheduler(
     """Run the RSMA/JRGEP scheduler on generated DAG tasks."""
     rng = random.Random(random_seed)
     tasks = graphs_to_tasks(graphs, loss_threshold)
-    experts = build_simple_experts(num_experts)
+    feature_bits_by_name = build_feature_bits(num_iot_features, default_feature_bits, feature_bits_range, rng)
+    experts = build_simple_experts(num_experts, memory_range=expert_memory_range, rng=rng)
     servers = build_simple_servers(
         num_servers=num_servers,
         experts=experts,
         experts_per_server=experts_per_server,
         gpu_memory=server_gpu_memory,
+        gpu_memory_range=server_gpu_memory_range,
         wired_rate_range=wired_rate_range,
         rng=rng,
     )
@@ -699,6 +754,8 @@ def run_rsma_scheduler(
                 noise_power=noise_power,
             common_power_ratio=common_power_ratio,
             default_power=max_device_power,
+            default_feature_bits=default_feature_bits,
+            feature_bits_by_name=feature_bits_by_name,
             default_loss_threshold=loss_threshold if loss_threshold is not None else 3.0,
             lambda_reconstruction=lambda_reconstruction,
             calibration_alpha=calibration_alpha,
@@ -714,12 +771,15 @@ def run_rsma_scheduler(
             "num_servers": num_servers,
             "num_iot_devices": num_iot_devices,
             "features_per_device_range": features_per_device_range,
+            "expert_memory_range": expert_memory_range,
             "experts_per_server": experts_per_server,
-            "server_gpu_memory": server_gpu_memory,
+            "server_gpu_memory_range": server_gpu_memory_range,
             "wired_rate_range": wired_rate_range,
             "bandwidth_mode": "derived",
             "bandwidth_time_fraction": bandwidth_time_fraction,
             "default_feature_bits": default_feature_bits,
+            "feature_bits_range": feature_bits_range,
+            "feature_bits_by_name": feature_bits_by_name,
             "wavelength": wavelength,
             "noise_power": noise_power,
             "common_power_ratio": common_power_ratio,

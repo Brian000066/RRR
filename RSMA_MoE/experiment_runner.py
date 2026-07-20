@@ -61,6 +61,8 @@ def generate_task_graphs(config: ExperimentConfig, seeds: RunSeeds, verbose: boo
         task_deadline_seconds_range=config.task_deadline_seconds_range,
         reconstruction_sigma=config.reconstruction_sigma,
         reconstruction_error_range=config.reconstruction_error_range,
+        gating_peak_count_range=config.gating_peak_count_range,
+        gating_peak_mass_range=config.gating_peak_mass_range,
         num_calibration_samples=config.num_calibration_samples,
         calibration_loss_range=config.calibration_loss_range,
         verbose=verbose,
@@ -76,6 +78,7 @@ def generate_task_graphs(config: ExperimentConfig, seeds: RunSeeds, verbose: boo
 def common_scheduler_kwargs(config: ExperimentConfig, seeds: RunSeeds) -> dict[str, Any]:
     return {
         "num_experts": config.num_experts,
+        "expert_memory_range": config.expert_memory_range,
         "num_iot_features": config.num_iot_features,
         "num_servers": config.num_edge_servers,
         "num_iot_devices": config.num_iot_devices,
@@ -83,13 +86,14 @@ def common_scheduler_kwargs(config: ExperimentConfig, seeds: RunSeeds) -> dict[s
         "server_feature_overlap_ratio": config.iot_server_feature_overlap_ratio,
         "global_random_feature_fraction": config.iot_global_random_feature_fraction,
         "experts_per_server": config.experts_per_server,
-        "server_gpu_memory": config.server_gpu_memory,
+        "server_gpu_memory_range": config.server_gpu_memory_range,
         "wired_rate_range": config.wired_rate_range,
         "c_bw": config.c_bw,
         "c_act": config.c_act,
         "c_fwd": config.c_fwd,
         "bandwidth_time_fraction": config.bandwidth_time_fraction,
         "default_feature_bits": config.default_feature_bits,
+        "feature_bits_range": config.feature_bits_range,
         "wavelength": config.wavelength,
         "noise_power": config.noise_power,
         "common_power_ratio": config.common_power_ratio,
@@ -386,7 +390,7 @@ def run_experiment(config: ExperimentConfig | None = None) -> dict[str, Any]:
             f"\nRun {run_index + 1}/{config.num_runs}: "
             f"DAG seed={seeds.dag_seed}, network seed={seeds.network_seed}"
         )
-        graphs = generate_task_graphs(config, seeds, verbose=False, export_artifacts=False)
+        graphs = generate_task_graphs(config, seeds, verbose=False, export_artifacts=(run_index == 0))
         results = run_enabled_methods(
             config,
             graphs,

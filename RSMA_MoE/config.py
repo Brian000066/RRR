@@ -15,7 +15,7 @@ class ExperimentConfig:
     # Reproducibility / output.
     auto_random_seed: bool = True
     num_runs: int = 1000
-    num_dags: int = 10
+    num_dags: int = 3
     random_seed: int = 42
     network_random_seed: int = 1
     output_dir: Path = BASE_DIR / "generated_dags"
@@ -39,13 +39,16 @@ class ExperimentConfig:
     )
 
     # Expert / task metadata settings.
-    num_experts: int = 12
-    task_deadline_seconds_range: tuple[int, int] = (60, 120)
+    num_experts: int = 36
+    expert_memory_range: tuple[float, float] = (128.0, 256.0)
+    task_deadline_seconds_range: tuple[int, int] = (30, 120)
     num_iot_features: int = 100
     iot_features_per_node_range: tuple[int, int] = (1, 3)
+    gating_peak_count_range: tuple[int, int] = (2, 4)
+    gating_peak_mass_range: tuple[float, float] = (0.65, 0.85)
 
     # Performance loss settings.
-    loss_threshold: Optional[float] = 7.0
+    loss_threshold: Optional[float] = 6.0
     lambda_reconstruction: float = 0.8
     calibration_alpha: float = 0.1
     reconstruction_sigma: float = 1.0
@@ -84,12 +87,13 @@ class ExperimentConfig:
     iot_features_per_device_range: tuple[int, int] = (4, 9)
     iot_server_feature_overlap_ratio: float = 0.25
     iot_global_random_feature_fraction: float = 0.15
-    experts_per_server: int = 4
-    server_gpu_memory: float = 1024.0
+    experts_per_server: int = 3
+    server_gpu_memory_range: tuple[float, float] = (768.0, 1024.0)
     wired_rate_range: tuple[float, float] = (5e8, 1.5e9)
     bandwidth_time_fraction: float = 1.0
     wavelength: float = 0.125
-    default_feature_bits: float = 12000.0
+    default_feature_bits: float = 120000.0
+    feature_bits_range: tuple[float, float] = (8000.0, 80000.0)
     noise_power: float = 1e-18
     common_power_ratio: float = 0.6
     max_device_power: float = 1.2589e-3
@@ -100,6 +104,6 @@ class ExperimentConfig:
     # Calibrated so activation, bandwidth, and forwarding each contribute a
     # similar order of magnitude in a typical run.
     # 5,000 Hz bandwidth gap contributes 500 cost with c_bw=0.1.
-    c_bw: float = 1e-1
-    c_act: float = 60.0
-    c_fwd: float = 0.3
+    c_bw: float = 0.03
+    c_act: float = 20.0
+    c_fwd: float = 3.0

@@ -32,6 +32,7 @@ from compared_method.hybrid_topk_distance_backhaul import (  # noqa: E402
     result_to_jsonable as hybrid_result_to_jsonable,
 )
 from rsma_integration import (  # noqa: E402
+    build_feature_bits,
     build_simple_devices,
     build_simple_experts,
     build_simple_servers,
@@ -124,6 +125,8 @@ def run_hybrid_topk_gssgd_backhaul(
     output_path: Path,
     num_experts: int,
     num_iot_features: int,
+    expert_memory_range: tuple[float, float] | None = None,
+    feature_bits_range: tuple[float, float] | None = None,
     top_k: int = 2,
     num_servers: int = 9,
     num_iot_devices: int = 100,
@@ -132,6 +135,7 @@ def run_hybrid_topk_gssgd_backhaul(
     global_random_feature_fraction: float = 0.15,
     experts_per_server: int = 4,
     server_gpu_memory: float = 8192.0,
+    server_gpu_memory_range: tuple[float, float] | None = None,
     wired_rate_range: tuple[float, float] | None = None,
     c_bw: float = 1e-3,
     c_act: float = 1.0,
@@ -160,12 +164,14 @@ def run_hybrid_topk_gssgd_backhaul(
     del clusters_per_server, kmeans_iterations
     rng = random.Random(random_seed)
     tasks = graphs_to_tasks(graphs, loss_threshold)
-    experts = build_simple_experts(num_experts)
+    feature_bits_by_name = build_feature_bits(num_iot_features, default_feature_bits, feature_bits_range, rng)
+    experts = build_simple_experts(num_experts, memory_range=expert_memory_range, rng=rng)
     servers = build_simple_servers(
         num_servers=num_servers,
         experts=experts,
         experts_per_server=experts_per_server,
         gpu_memory=server_gpu_memory,
+        gpu_memory_range=server_gpu_memory_range,
         wired_rate_range=wired_rate_range,
         rng=rng,
     )
@@ -202,11 +208,12 @@ def run_hybrid_topk_gssgd_backhaul(
             noise_power=noise_power,
             common_power_ratio=common_power_ratio,
             default_power=max_device_power,
+            default_feature_bits=default_feature_bits,
+            feature_bits_by_name=feature_bits_by_name,
             default_loss_threshold=loss_threshold if loss_threshold is not None else 3.0,
             lambda_reconstruction=lambda_reconstruction,
             calibration_alpha=calibration_alpha,
             reconstruction_sigma=reconstruction_sigma,
-            default_feature_bits=default_feature_bits,
             wavelength=wavelength,
         ),
     )
@@ -230,12 +237,15 @@ def run_hybrid_topk_gssgd_backhaul(
             "num_servers": num_servers,
             "num_iot_devices": num_iot_devices,
             "features_per_device_range": features_per_device_range,
+            "expert_memory_range": expert_memory_range,
             "experts_per_server": experts_per_server,
-            "server_gpu_memory": server_gpu_memory,
+            "server_gpu_memory_range": server_gpu_memory_range,
             "wired_rate_range": wired_rate_range,
             "bandwidth_mode": "derived_by_group_slack",
             "bandwidth_time_fraction": bandwidth_time_fraction,
             "default_feature_bits": default_feature_bits,
+            "feature_bits_range": feature_bits_range,
+            "feature_bits_by_name": feature_bits_by_name,
             "wavelength": wavelength,
             "noise_power": noise_power,
             "common_power_ratio": common_power_ratio,

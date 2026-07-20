@@ -97,6 +97,7 @@ class FormulationConfig:
     min_rate: float = 1.0
     output_token_bits: float = 16.0
     default_feature_bits: float = 12_000.0
+    feature_bits_by_name: Dict[str, float] = field(default_factory=dict)
     default_loss_threshold: float = 3.0
     lambda_reconstruction: float = 0.1
     calibration_alpha: float = 0.1
@@ -855,8 +856,14 @@ class FormulationEvaluator:
     def default_private_power(self, device_id: DeviceId) -> float:
         return self.devices[device_id].max_power * (1.0 - self.config.common_power_ratio)
 
+    def feature_bits(self, feature: str) -> float:
+        return max(float(self.config.feature_bits_by_name.get(feature, self.config.default_feature_bits)), 0.0)
+
+    def feature_set_volume(self, features: Iterable[str]) -> float:
+        return sum(self.feature_bits(feature) for feature in set(features))
+
     def device_feature_volume(self, device_id: DeviceId) -> float:
-        return max(len(self.devices[device_id].features), 1) * self.config.default_feature_bits
+        return self.feature_set_volume(self.devices[device_id].features)
 
     def group_payload_features(self, group: GroupSpec) -> Set[str]:
         payload: Set[str] = set()
@@ -879,13 +886,13 @@ class FormulationEvaluator:
         return (set(self.devices[device_id].features) & payload) - common
 
     def group_feature_volume(self, group: GroupSpec) -> float:
-        return len(self.group_payload_features(group)) * self.config.default_feature_bits
+        return self.feature_set_volume(self.group_payload_features(group))
 
     def group_common_volume(self, group: GroupSpec) -> float:
-        return len(self.group_common_features(group)) * self.config.default_feature_bits
+        return self.feature_set_volume(self.group_common_features(group))
 
     def group_private_volume(self, group: GroupSpec, device_id: DeviceId) -> float:
-        return len(self.group_private_features(group, device_id)) * self.config.default_feature_bits
+        return self.feature_set_volume(self.group_private_features(group, device_id))
 
     def feature_ready_time(
         self,

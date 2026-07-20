@@ -46,7 +46,7 @@ python main.py
 |---|---:|---|
 | `auto_random_seed` | `True` | 每次 run 自動產生 DAG seed 與 network seed。 |
 | `num_runs` | `100` | 重複實驗次數，最後輸出平均結果。 |
-| `num_dags` | `10` | 每次 run 產生 10 個 task graphs。 |
+| `num_dags` | `3` | 每次 run 生成 3 個 Task graph。若 activation cost 再度飽和，可以降到 `1` 來觀察單一 graph 的 expert 啟用差異。 |
 | `random_seed` | `42` | `auto_random_seed=False` 時使用的 DAG seed 起點。 |
 | `network_random_seed` | `1` | `auto_random_seed=False` 時使用的 network seed 起點。 |
 | `output_dir` | `generated_dags/` | DAG artifact 輸出位置。 |
@@ -72,10 +72,15 @@ python main.py
 
 | 參數 | 目前值 | 說明 |
 |---|---:|---|
-| `num_experts` | `12` | 全域 expert 數量。 |
+| `num_experts` | `36` | 全域 expert 數量；目前等於 `num_edge_servers * experts_per_server`，讓 activation 不會因 expert pool 太小而容易全部啟用。 |
+| `expert_memory_range` | `(128.0, 256.0)` | 每個 expert 的 model size 隨機範圍。 |
 | `task_deadline_seconds_range` | `(60, 120)` | 每個 task 的 deadline 秒數範圍。 |
 | `num_iot_features` | `100` | 全域 IoT feature index 數量。 |
 | `iot_features_per_node_range` | `(1, 3)` | 每個 node 需要的 IoT feature 數量。 |
+| `gating_peak_count_range` | `(2, 4)` | 每個 subtask 會有 2 到 4 個 gating 高峰 experts。 |
+| `gating_peak_mass_range` | `(0.65, 0.85)` | 高峰 experts 合計拿走 65% 到 85% 的 gating mass，其餘 experts 分享 tail mass。 |
+
+Gating network 目前不是平均亂數，而是 peaked distribution：每個 subtask 會抽出少數高峰 experts，讓它們合計取得大部分 gating mass。`gating_weights` 仍會正規化且總和等於 1。
 
 每個 node 會包含：
 
@@ -91,7 +96,7 @@ python main.py
 
 | 參數 | 目前值 | 說明 |
 |---|---:|---|
-| `loss_threshold` | `7.0` | 每個 node 的 loss bound `q_hat`。若為 `None`，改用 calibration quantile。 |
+| `loss_threshold` | `5.0` | 每個 node 的 loss bound `q_hat`。數值越小代表 Performance loss constraint 越嚴格；若為 `None`，改用 calibration quantile。 |
 | `lambda_reconstruction` | `0.8` | Reconstruction loss 權重。 |
 | `calibration_alpha` | `0.1` | Calibration tolerated violation risk。 |
 | `reconstruction_sigma` | `1.0` | Reconstruction loss 中的 sigma。 |
@@ -142,12 +147,13 @@ python main.py
 | `iot_features_per_device_range` | `(4, 9)` | 每個 IoT 儲存的 feature 數量範圍。 |
 | `iot_server_feature_overlap_ratio` | `0.25` | 鄰近 server feature pool 的重疊比例。 |
 | `iot_global_random_feature_fraction` | `0.15` | IoT feature 中保留的全域隨機比例，使 feature 與位置正相關但不完全相關。 |
-| `experts_per_server` | `4` | 每台 server 儲存的 experts 數量。Expert 不重複配置。 |
-| `server_gpu_memory` | `1024.0` | 每台 server GPU memory。 |
+| `experts_per_server` | `3` | 每台 server 最多儲存的 experts 數量。因為 expert 不重複配置，若 `num_experts < num_edge_servers * experts_per_server`，部分 slot 會是空的。 |
+| `server_gpu_memory_range` | `(768.0, 1024.0)` | 每台 server GPU capacity 隨機範圍。目前下限設為 `3 * max_expert_memory`，避免 GPU 容量不足干擾 performance loss constraint 測試。 |
 | `wired_rate_range` | `(5e8, 1.5e9)` | 每條 server-server wired/backhaul link 隨機 rate 範圍。 |
 | `bandwidth_time_fraction` | `1.0` | Fallback bandwidth budget 使用最小 task deadline 的比例；有 dependent subtask 時使用更嚴格的 group-specific remaining time。 |
 | `wavelength` | `0.125` | DB phase term 使用的波長。 |
-| `default_feature_bits` | `12000.0` | 每個 feature 的資料量。 |
+| `default_feature_bits` | `1200000.0` | Feature size 的 fallback。 |
+| `feature_bits_range` | `(800000.0, 2400000.0)` | 每個 feature 的資料量隨機範圍，實際 group payload 會把 group 內 IoT 所有 features 的 bits 做 union 後加總。 |
 | `noise_power` | `1e-18` | SINR denominator 的 noise power。 |
 | `common_power_ratio` | `0.6` | IoT power 中 common stream 的比例；private stream 為 `0.4`。 |
 | `max_device_power` | `1.2589e-3` | IoT device power，對齊 SIoT 設定。 |

@@ -5,17 +5,55 @@ import random
 import networkx as nx
 
 
-def make_gating_weights(num_experts: int, rng: random.Random) -> list[float]:
-    """Create normalized gating weights whose sum is exactly 1.0."""
-    raw_weights = [rng.random() for _ in range(num_experts)]
-    total = sum(raw_weights)
+def make_gating_weights(
+    num_experts: int,
+    rng: random.Random,
+    peak_count_range: tuple[int, int] = (2, 4),
+    peak_mass_range: tuple[float, float] = (0.65, 0.85),
+) -> list[float]:
+    """Create peaked MoE gating weights whose sum is exactly 1.0.
 
-    if total == 0:
-        return [1.0 / num_experts for _ in range(num_experts)]
+    A small set of experts receives most of the probability mass, while the
+    remaining experts share a low tail. This is closer to a real MoE router
+    than normalizing independent uniform random numbers.
+    """
+    if num_experts < 1:
+        raise ValueError("num_experts must be at least 1.")
+    if num_experts == 1:
+        return [1.0]
 
-    weights = [round(weight / total, 6) for weight in raw_weights]
-    weights[-1] = round(1.0 - sum(weights[:-1]), 6)
-    return weights
+    min_peaks, max_peaks = peak_count_range
+    if min_peaks < 1 or max_peaks < min_peaks:
+        raise ValueError("gating_peak_count_range must be (min_count, max_count).")
+    min_peaks = min(min_peaks, num_experts)
+    max_peaks = min(max_peaks, num_experts)
+
+    min_mass, max_mass = peak_mass_range
+    if not 0.0 < min_mass <= max_mass < 1.0:
+        raise ValueError("gating_peak_mass_range must satisfy 0 < min <= max < 1.")
+
+    peak_count = rng.randint(min_peaks, max_peaks)
+    peak_indices = set(rng.sample(range(num_experts), peak_count))
+    peak_mass = rng.uniform(min_mass, max_mass)
+    tail_mass = 1.0 - peak_mass
+
+    peak_raw = {index: rng.uniform(0.8, 1.2) for index in peak_indices}
+    tail_indices = [index for index in range(num_experts) if index not in peak_indices]
+    tail_raw = {index: rng.uniform(0.05, 0.35) for index in tail_indices}
+
+    weights = [0.0 for _ in range(num_experts)]
+    peak_total = sum(peak_raw.values())
+    tail_total = sum(tail_raw.values())
+
+    for index, value in peak_raw.items():
+        weights[index] = peak_mass * value / peak_total
+    if tail_indices and tail_total > 0.0:
+        for index, value in tail_raw.items():
+            weights[index] = tail_mass * value / tail_total
+
+    rounded = [round(weight, 6) for weight in weights]
+    rounded[-1] = round(1.0 - sum(rounded[:-1]), 6)
+    return rounded
 
 
 def make_expert_confidence(num_experts: int, rng: random.Random) -> list[float]:
@@ -93,6 +131,8 @@ def make_node_attributes(
     rng: random.Random,
     reconstruction_sigma: float = 1.0,
     reconstruction_error_range: tuple[float, float] = (0.8, 1.5),
+    gating_peak_count_range: tuple[int, int] = (2, 4),
+    gating_peak_mass_range: tuple[float, float] = (0.65, 0.85),
     num_calibration_samples: int = 20,
     calibration_loss_range: tuple[float, float] = (1.0, 4.0),
 ) -> dict[str, object]:
@@ -116,7 +156,12 @@ def make_node_attributes(
             "upstream_outputs": [],
             "iot_features": iot_features,
         },
-        "gating_weights": make_gating_weights(num_experts, rng),
+        "gating_weights": make_gating_weights(
+            num_experts,
+            rng,
+            peak_count_range=gating_peak_count_range,
+            peak_mass_range=gating_peak_mass_range,
+        ),
         "expert_confidence": make_expert_confidence(num_experts, rng),
         "reconstruction_errors": reconstruction_errors,
         "reconstruction_loss": compute_reconstruction_loss(

@@ -14,7 +14,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from rsma_integration import build_simple_devices, build_simple_experts, build_simple_servers, graphs_to_tasks  # noqa: E402
+from rsma_integration import build_feature_bits, build_simple_devices, build_simple_experts, build_simple_servers, graphs_to_tasks  # noqa: E402
 from utils.formulation import (  # noqa: E402
     AssignmentKey,
     DeviceId,
@@ -231,15 +231,20 @@ class ChainedComparisonPipeline:
                 label = self._assignment_label(key)
                 selected: List[Tuple[ServerId, ExpertId]] = []
                 selected_experts: Set[ExpertId] = set()
-                for expert_id in self._top_k_experts(subtask):
+                for expert_id in self._ranked_experts(subtask):
+                    if len(selected) >= self.top_k:
+                        break
                     server_id = self._best_server_for_expert(expert_id, activated, used_memory)
                     if server_id is None:
-                        self.scheduler_violations.append(f"TopK placement: no feasible server stores {expert_id} for {key}")
                         continue
                     if not self._append_unique_assignment(selected, server_id, expert_id):
                         continue
                     selected_experts.add(expert_id)
                     self._activate(server_id, expert_id, activated, used_memory)
+                if len(selected) < min(self.top_k, len(self.experts)):
+                    self.scheduler_violations.append(
+                        f"TopK placement: only {len(selected)} feasible experts for {key}; target {self.top_k}"
+                    )
                 assignments[key] = selected
                 selected_experts_by_key[key] = selected_experts
                 selected_probability[label] = self.evaluator.selection_probability(subtask, selected_experts)
@@ -420,9 +425,12 @@ class ChainedComparisonPipeline:
                 for server_id in self.evaluator.participating_servers(assignments, key):
                     required.setdefault(server_id, set()).update(subtask.required_features)
         return required
-    def _top_k_experts(self, subtask: SubtaskSpec) -> List[ExpertId]:
+    def _ranked_experts(self, subtask: SubtaskSpec) -> List[ExpertId]:
         ranked = sorted(self.experts, key=lambda eid: self._expert_score(subtask, eid), reverse=True)
-        return [eid for eid in ranked if self._expert_score(subtask, eid) > 0.0][: min(self.top_k, len(ranked))]
+        return [eid for eid in ranked if self._expert_score(subtask, eid) > 0.0]
+
+    def _top_k_experts(self, subtask: SubtaskSpec) -> List[ExpertId]:
+        return self._ranked_experts(subtask)[: min(self.top_k, len(self.experts))]
 
     def _expert_score(self, subtask: SubtaskSpec, expert_id: ExpertId) -> float:
         expert = self.experts[expert_id]
@@ -663,20 +671,20 @@ class ChainedComparisonPipeline:
         resolved: List[GroupSpec] = []
         for group in groups:
             group_key = (group.server_id, group.id)
-            budget = self._strict_group_budget(group_key, dependencies, downstream)
+            budget = self._strict_group_budget(group, dependencies, downstream)
             budgets[group_key] = budget
             bandwidth = self.evaluator.derive_group_bandwidth_for_budget(group, budget)
             resolved.append(replace(group, bandwidth=bandwidth))
         return resolved, budgets
     def _group_dependencies(self, groups, assignments, data_req, backhaul, feature_to_groups):
-        dependencies: Dict[GroupKey, Set[AssignmentKey]] = {(g.server_id, g.id): set() for g in groups}
+        dependencies: Dict[GroupKey, Set[Tuple[AssignmentKey, ServerId]]] = {(g.server_id, g.id): set() for g in groups}
         for key in assignments:
             label = self._assignment_label(key)
             for target_server, features in data_req.get(label, {}).items():
                 for feature in features:
                     group = self._serving_group_for_feature(feature, target_server, backhaul, feature_to_groups)
                     if group is not None:
-                        dependencies.setdefault((group.server_id, group.id), set()).add(key)
+                        dependencies.setdefault((group.server_id, group.id), set()).add((key, target_server))
         return dependencies
 
     def _serving_group_for_feature(self, feature, target_server, backhaul, feature_to_groups):
@@ -717,17 +725,21 @@ class ChainedComparisonPipeline:
     def _subtask_compute_time(self, key, assignments):
         return max((self.experts[eid].latency for _, eid in assignments.get(key, [])), default=0.0)
 
-    def _strict_group_budget(self, group_key, dependencies, downstream):
-        dependent_keys = dependencies.get(group_key, set())
-        if not dependent_keys:
+    def _strict_group_budget(self, group, dependencies, downstream):
+        group_key = (group.server_id, group.id)
+        dependent_items = dependencies.get(group_key, set())
+        if not dependent_items:
             return self.evaluator.bandwidth_time_budget()
         budgets = []
-        for task_id, subtask_id in dependent_keys:
+        for (task_id, subtask_id), target_server in dependent_items:
             task = self.tasks[task_id]
             if task.deadline == float("inf"):
                 budgets.append(self.evaluator.bandwidth_time_budget())
             else:
-                remaining = task.deadline - downstream.get((task_id, subtask_id), 0.0)
+                backhaul_time = 0.0
+                if group.server_id != target_server:
+                    backhaul_time = self.evaluator.group_feature_volume(group) / self.evaluator.wired_rate(group.server_id, target_server)
+                remaining = task.deadline - downstream.get((task_id, subtask_id), 0.0) - backhaul_time
                 budgets.append(max(remaining, 1e-12))
         return max(min(budgets), 1e-12)
 
@@ -865,6 +877,8 @@ def run_chained_pipeline(
     output_path: Path,
     num_experts: int,
     num_iot_features: int,
+    expert_memory_range: tuple[float, float] | None = None,
+    feature_bits_range: tuple[float, float] | None = None,
     top_k: int = 2,
     num_servers: int = 9,
     num_iot_devices: int = 100,
@@ -873,6 +887,7 @@ def run_chained_pipeline(
     global_random_feature_fraction: float = 0.15,
     experts_per_server: int = 4,
     server_gpu_memory: float = 8192.0,
+    server_gpu_memory_range: tuple[float, float] | None = None,
     wired_rate_range: tuple[float, float] | None = None,
     c_bw: float = 1e-3,
     c_act: float = 1.0,
@@ -900,12 +915,14 @@ def run_chained_pipeline(
 ) -> ChainedPipelineResult:
     rng = random.Random(random_seed)
     tasks = graphs_to_tasks(graphs, loss_threshold)
-    experts = build_simple_experts(num_experts)
+    feature_bits_by_name = build_feature_bits(num_iot_features, default_feature_bits, feature_bits_range, rng)
+    experts = build_simple_experts(num_experts, memory_range=expert_memory_range, rng=rng)
     servers = build_simple_servers(
         num_servers=num_servers,
         experts=experts,
         experts_per_server=experts_per_server,
         gpu_memory=server_gpu_memory,
+        gpu_memory_range=server_gpu_memory_range,
         wired_rate_range=wired_rate_range,
         rng=rng,
     )
@@ -943,11 +960,12 @@ def run_chained_pipeline(
             noise_power=noise_power,
             common_power_ratio=common_power_ratio,
             default_power=max_device_power,
+            default_feature_bits=default_feature_bits,
+            feature_bits_by_name=feature_bits_by_name,
             default_loss_threshold=loss_threshold if loss_threshold is not None else 3.0,
             lambda_reconstruction=lambda_reconstruction,
             calibration_alpha=calibration_alpha,
             reconstruction_sigma=reconstruction_sigma,
-            default_feature_bits=default_feature_bits,
             wavelength=wavelength,
         ),
     )
@@ -974,12 +992,15 @@ def run_chained_pipeline(
             "num_servers": num_servers,
             "num_iot_devices": num_iot_devices,
             "features_per_device_range": features_per_device_range,
+            "expert_memory_range": expert_memory_range,
             "experts_per_server": experts_per_server,
-            "server_gpu_memory": server_gpu_memory,
+            "server_gpu_memory_range": server_gpu_memory_range,
             "wired_rate_range": wired_rate_range,
             "bandwidth_mode": "derived_by_group_slack",
             "bandwidth_time_fraction": bandwidth_time_fraction,
             "default_feature_bits": default_feature_bits,
+            "feature_bits_range": feature_bits_range,
+            "feature_bits_by_name": feature_bits_by_name,
             "wavelength": wavelength,
             "noise_power": noise_power,
             "common_power_ratio": common_power_ratio,
