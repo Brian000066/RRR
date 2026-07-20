@@ -644,7 +644,8 @@ class FormulationEvaluator:
                 for sub in ready:
                     key = (task.id, sub.id)
                     for server_id in self.participating_servers(assignments, key):
-                        feature_ready[(key, server_id)] = self.feature_ready_time(server_id, sub, group_by_device, uplink, backhaul, None if subtask_features is None else subtask_features.get(key, set()))
+                        server_features = None if subtask_features is None else self.features_for_server(subtask_features, key, server_id)
+                        feature_ready[(key, server_id)] = self.feature_ready_time(server_id, sub, group_by_device, uplink, backhaul, server_features)
                         pred_ready[(key, server_id)] = self.predecessor_ready_time(task, sub, server_id, assignments, finish)
                         start[(key, server_id)] = max(feature_ready[(key, server_id)], pred_ready[(key, server_id)])
                         finish[(key, server_id)] = start[(key, server_id)] + self.server_computation_time(key, server_id, assignments)
@@ -689,8 +690,8 @@ class FormulationEvaluator:
         for task in self.tasks.values():
             for sub in task.subtasks:
                 threshold = self.conformal_loss_threshold(sub)
-                selected_features = None if subtask_features is None else subtask_features.get((task.id, sub.id), set())
-                loss = sub.max_loss if sub.max_loss is not None else self.estimated_loss((task.id, sub.id), assignments, selected_features)
+                key = (task.id, sub.id)
+                loss = sub.max_loss if sub.max_loss is not None else self.estimated_loss_for_assignment(key, assignments, subtask_features)
                 if loss > threshold:
                     violations.append(f"C3 performance loss: {(task.id, sub.id)} loss {loss:.6g} > {threshold:.6g}")
 
@@ -1011,6 +1012,66 @@ class FormulationEvaluator:
             for expert_id in expert_ids
             if expert_id in self.experts
         )
+
+    def features_for_server(
+        self,
+        subtask_features: Mapping[Any, Set[str]],
+        key: AssignmentKey,
+        server_id: ServerId,
+    ) -> Set[str]:
+        server_key = (key[0], key[1], server_id)
+        if server_key in subtask_features:
+            return set(subtask_features.get(server_key, set()))
+        return set(subtask_features.get(key, set()))
+
+    def average_reconstruction_loss_for_assignment(
+        self,
+        subtask: SubtaskSpec,
+        key: AssignmentKey,
+        assignments: Mapping[AssignmentKey, Sequence[Tuple[ServerId, ExpertId]]],
+        subtask_features: Optional[Mapping[Any, Set[str]]] = None,
+    ) -> float:
+        target_servers = self.participating_servers(assignments, key)
+        if not target_servers:
+            return subtask.reconstruction_loss
+        losses = []
+        for server_id in target_servers:
+            selected = None if subtask_features is None else self.features_for_server(subtask_features, key, server_id)
+            losses.append(self.reconstruction_loss_for_features(subtask, selected))
+        return sum(losses) / len(losses)
+
+    def performance_loss_from_probability_and_reconstruction(
+        self,
+        probability: float,
+        reconstruction_loss: float,
+    ) -> float:
+        if probability <= self.config.min_selection_probability:
+            return float("inf")
+        return (1.0 / probability) + (self.config.lambda_reconstruction * reconstruction_loss)
+
+    def estimated_loss_for_assignment(
+        self,
+        key: AssignmentKey,
+        assignments: Mapping[AssignmentKey, Sequence[Tuple[ServerId, ExpertId]]],
+        subtask_features: Optional[Mapping[Any, Set[str]]] = None,
+    ) -> float:
+        pairs = assignments.get(key, [])
+        if not pairs:
+            return float("inf")
+        subtask = self.subtask_by_key(key)
+        if subtask is None:
+            return float("inf")
+        probability = self.selection_probability(
+            subtask,
+            (expert_id for _, expert_id in pairs),
+        )
+        reconstruction_loss = self.average_reconstruction_loss_for_assignment(
+            subtask,
+            key,
+            assignments,
+            subtask_features,
+        )
+        return self.performance_loss_from_probability_and_reconstruction(probability, reconstruction_loss)
 
     def reconstruction_loss_for_features(
         self,

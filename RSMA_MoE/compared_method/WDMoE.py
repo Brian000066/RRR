@@ -38,16 +38,17 @@ from utils.formulation import AssignmentKey, ExpertId, FormulationConfig, Server
 class WDMoEExpertSelectionMixin:
     """DAG-aware WDMoE expert selection adapted to per-subtask loss bounds.
 
-    Each DAG node first builds the ordinary Top-K baseline and a full expert
-    latency vector. If cosine(G, latency) is below the WDMoE threshold, the
-    lowest-gating selected expert is pruned once. The prune is kept only when
-    the node-level WLR ratio remains above the configured target.
+    For each task graph, the ordinary Top-K result is used as the WLR baseline.
+    The WDMoE threshold theta starts from alpha and increases by Delta-theta;
+    each theta trial reruns all subtasks from the same pre-task state. A subtask
+    whose cosine(G, latency) is below theta drops the lowest-gating selected
+    expert once, matching the paper-style Top-K to K-1 pruning behavior.
     """
 
     allow_expert_loss_repair: bool = False
     wdmoe_initial_threshold: float = 0.8
     wdmoe_threshold_step: float = 0.05
-    wdmoe_max_threshold: float = 0.8
+    wdmoe_max_threshold: float = 1.0
     wdmoe_wlr_target_ratio: float = 1.05
 
     def _assign_topk_experts(self):
@@ -84,10 +85,93 @@ class WDMoEExpertSelectionMixin:
         return assignments, selected_probability, selected_experts_by_key, activated, used_memory
 
     def _wdmoe_assign_task_graph(self, task, committed_assignments, activated, used_memory):
+        base_activated = {sid: set(eids) for sid, eids in activated.items()}
+        base_memory = dict(used_memory)
+
+        _, _, _, _, baseline_node_metrics = self._wdmoe_run_task_trial(
+            task=task,
+            committed_assignments=committed_assignments,
+            activated={sid: set(eids) for sid, eids in base_activated.items()},
+            used_memory=dict(base_memory),
+            theta=None,
+            allow_pruning=False,
+        )
+        baseline_wlr = self._wdmoe_task_wlr(baseline_node_metrics, "baseline_wlr")
+
+        max_theta = min(float(self.wdmoe_max_threshold), 1.0)
+        theta = float(self.wdmoe_initial_threshold)
+        step = max(float(self.wdmoe_threshold_step), 1e-12)
+        best_trial = None
+        theta_trials = []
+        met_gamma = False
+
+        while theta <= max_theta + 1e-12:
+            trial_assignments, trial_selected, trial_activated, trial_memory, node_metrics = self._wdmoe_run_task_trial(
+                task=task,
+                committed_assignments=committed_assignments,
+                activated={sid: set(eids) for sid, eids in base_activated.items()},
+                used_memory=dict(base_memory),
+                theta=theta,
+                allow_pruning=True,
+            )
+            selected_wlr = self._wdmoe_task_wlr(node_metrics, "selected_wlr")
+            ratio = selected_wlr / max(baseline_wlr, 1e-12)
+            pruned_nodes = sum(1 for item in node_metrics.values() if item.get("pruned", False))
+            trial_summary = {
+                "theta": theta,
+                "selected_wlr": selected_wlr,
+                "wlr_ratio": ratio,
+                "pruned_nodes": pruned_nodes,
+            }
+            theta_trials.append(trial_summary)
+            best_trial = (trial_assignments, trial_selected, trial_activated, trial_memory, node_metrics, theta, ratio)
+            if ratio > self.wdmoe_wlr_target_ratio:
+                met_gamma = True
+                break
+            if theta >= max_theta - 1e-12:
+                break
+            theta = min(theta + step, max_theta)
+
+        if best_trial is None:
+            best_trial = self._wdmoe_run_task_trial(
+                task=task,
+                committed_assignments=committed_assignments,
+                activated={sid: set(eids) for sid, eids in base_activated.items()},
+                used_memory=dict(base_memory),
+                theta=max_theta,
+                allow_pruning=True,
+            ) + (max_theta, 1.0)
+
+        task_assignments, selected_by_key, committed_activated, committed_memory, node_metrics, final_theta, ratio = best_trial
+        selected_wlr = self._wdmoe_task_wlr(node_metrics, "selected_wlr")
+        pruned_nodes = sum(1 for item in node_metrics.values() if item.get("pruned", False))
+        metrics = {
+            "wlr_scope": "task_graph",
+            "baseline_wlr": baseline_wlr,
+            "selected_wlr": selected_wlr,
+            "wlr_ratio": ratio,
+            "initial_threshold": self.wdmoe_initial_threshold,
+            "final_threshold": final_theta,
+            "threshold_step": self.wdmoe_threshold_step,
+            "max_threshold": max_theta,
+            "met_gamma": met_gamma,
+            "pruned_nodes": pruned_nodes,
+            "theta_trials": theta_trials,
+            "nodes": node_metrics,
+        }
+        return task_assignments, selected_by_key, committed_activated, committed_memory, metrics
+
+    def _wdmoe_run_task_trial(
+        self,
+        task,
+        committed_assignments,
+        activated,
+        used_memory,
+        theta: Optional[float],
+        allow_pruning: bool,
+    ):
         task_assignments: Dict[AssignmentKey, list[tuple[ServerId, ExpertId]]] = {}
         selected_by_key: Dict[AssignmentKey, Set[ExpertId]] = {}
-        committed_activated = {sid: set(eids) for sid, eids in activated.items()}
-        committed_memory = dict(used_memory)
         node_metrics: Dict[str, Dict[str, float]] = {}
 
         for subtask in self._topological_subtasks(task):
@@ -97,25 +181,22 @@ class WDMoEExpertSelectionMixin:
                 subtask=subtask,
                 committed_assignments=committed_assignments,
                 task_assignments=task_assignments,
-                activated=committed_activated,
-                used_memory=committed_memory,
+                activated=activated,
+                used_memory=used_memory,
+                theta=theta,
+                allow_pruning=allow_pruning,
             )
             task_assignments[key] = pairs
             selected_by_key[key] = feasible_experts
             node_metrics[subtask.id] = metrics
 
-        baseline_values = [item["baseline_wlr"] for item in node_metrics.values()]
-        selected_values = [item["selected_wlr"] for item in node_metrics.values()]
-        baseline_avg = sum(baseline_values) / len(baseline_values) if baseline_values else 0.0
-        selected_avg = sum(selected_values) / len(selected_values) if selected_values else 0.0
-        metrics = {
-            "wlr_scope": "per_subtask",
-            "baseline_wlr": baseline_avg,
-            "selected_wlr": selected_avg,
-            "wlr_ratio": selected_avg / max(baseline_avg, 1e-12),
-            "nodes": node_metrics,
-        }
-        return task_assignments, selected_by_key, committed_activated, committed_memory, metrics
+        return task_assignments, selected_by_key, activated, used_memory, node_metrics
+
+    def _wdmoe_task_wlr(self, node_metrics: Mapping[str, Mapping[str, float]], key: str) -> float:
+        values = [float(item.get(key, 0.0)) for item in node_metrics.values()]
+        if not values:
+            return 0.0
+        return sum(values) / len(values)
 
     def _wdmoe_assign_subtask(
         self,
@@ -125,6 +206,8 @@ class WDMoEExpertSelectionMixin:
         task_assignments,
         activated,
         used_memory,
+        theta: Optional[float],
+        allow_pruning: bool,
     ):
         key = (task.id, subtask.id)
         latency_vector = self._wdmoe_latency_vector(
@@ -140,16 +223,11 @@ class WDMoEExpertSelectionMixin:
             baseline_experts = set(self._fallback_top_experts(subtask, count=self.top_k))
 
         baseline_wlr = self._wdmoe_subtask_wlr(subtask, baseline_experts, latency_vector)
-        best_experts = set(baseline_experts)
-        best_wlr = baseline_wlr
-        best_theta = None
-        met_gamma = False
         similarity = self._wdmoe_weight_latency_similarity(subtask, latency_vector)
-        threshold = self.wdmoe_initial_threshold
         candidate_experts = set(baseline_experts)
         attempted_pruning = False
 
-        if len(candidate_experts) > 1 and similarity <= threshold:
+        if allow_pruning and theta is not None and len(candidate_experts) > 1 and similarity <= theta:
             dropped = min(
                 candidate_experts,
                 key=lambda expert_id: (self._expert_score(subtask, expert_id), expert_id),
@@ -157,16 +235,9 @@ class WDMoEExpertSelectionMixin:
             candidate_experts.remove(dropped)
             attempted_pruning = True
 
-        current_wlr = self._wdmoe_subtask_wlr(subtask, candidate_experts, latency_vector)
-        current_ratio = current_wlr / max(baseline_wlr, 1e-12)
-        met_gamma = current_ratio > self.wdmoe_wlr_target_ratio
+        selected_wlr = self._wdmoe_subtask_wlr(subtask, candidate_experts, latency_vector)
 
-        if attempted_pruning and not met_gamma:
-            candidate_experts = set(baseline_experts)
-            current_wlr = baseline_wlr
-            current_ratio = 1.0
-
-        if attempted_pruning and candidate_experts != baseline_experts:
+        if attempted_pruning:
             candidate_probability = self.evaluator.selection_probability(subtask, candidate_experts)
             full_features = set(subtask.required_features)
             candidate_loss = self.evaluator.performance_loss_from_probability(
@@ -174,21 +245,16 @@ class WDMoEExpertSelectionMixin:
                 candidate_probability,
                 full_features,
             )
-            loss_threshold = self.evaluator.conformal_loss_threshold(subtask)
-            if candidate_loss > loss_threshold + 1e-12:
+            loss_bound = self.evaluator.conformal_loss_threshold(subtask)
+            if candidate_loss > loss_bound + 1e-12:
                 candidate_experts = set(baseline_experts)
-                current_wlr = baseline_wlr
-                current_ratio = 1.0
-                met_gamma = False
-
-        best_experts = candidate_experts
-        best_wlr = current_wlr
-        best_theta = threshold
+                selected_wlr = baseline_wlr
+                attempted_pruning = False
 
         pairs: list[tuple[ServerId, ExpertId]] = []
         feasible_experts: Set[ExpertId] = set()
-        target_count = len(best_experts)
-        ordered_experts = sorted(best_experts, key=lambda eid: (-self._expert_score(subtask, eid), eid))
+        target_count = len(candidate_experts)
+        ordered_experts = sorted(candidate_experts, key=lambda eid: (-self._expert_score(subtask, eid), eid))
         for expert_id in ordered_experts:
             server_id = self._best_server_for_expert_with_predecessors(
                 expert_id=expert_id,
@@ -224,26 +290,21 @@ class WDMoEExpertSelectionMixin:
             feasible_experts.add(expert_id)
             self._activate(server_id, expert_id, activated, used_memory)
 
-        if len(pairs) < target_count:
-            self.scheduler_violations.append(
-                f"WDMoE placement: only {len(pairs)} feasible experts for {key}; target {target_count}"
-            )
-
         if attempted_pruning and len(feasible_experts) < self.top_k:
             full_features = set(subtask.required_features)
-            loss_threshold = self.evaluator.conformal_loss_threshold(subtask)
+            loss_bound = self.evaluator.conformal_loss_threshold(subtask)
             probability = self.evaluator.selection_probability(subtask, feasible_experts)
             loss = self.evaluator.performance_loss_from_probability(subtask, probability, full_features)
-            while loss > loss_threshold + 1e-12 and len(feasible_experts) < self.top_k:
+            while loss > loss_bound + 1e-12 and len(feasible_experts) < self.top_k:
                 fallback = self._best_wdmoe_loss_repair_candidate(
-                task=task,
-                subtask=subtask,
-                selected_experts=feasible_experts,
-                committed_assignments=committed_assignments,
-                task_assignments=task_assignments,
-                activated=activated,
-                used_memory=used_memory,
-            )
+                    task=task,
+                    subtask=subtask,
+                    selected_experts=feasible_experts,
+                    committed_assignments=committed_assignments,
+                    task_assignments=task_assignments,
+                    activated=activated,
+                    used_memory=used_memory,
+                )
                 if fallback is None:
                     break
                 server_id, expert_id = fallback
@@ -253,22 +314,19 @@ class WDMoEExpertSelectionMixin:
                 self._activate(server_id, expert_id, activated, used_memory)
                 probability = self.evaluator.selection_probability(subtask, feasible_experts)
                 loss = self.evaluator.performance_loss_from_probability(subtask, probability, full_features)
-            if len(feasible_experts) > len(best_experts):
-                best_experts = set(feasible_experts)
-                best_wlr = self._wdmoe_subtask_wlr(subtask, best_experts, latency_vector)
-                current_ratio = best_wlr / max(baseline_wlr, 1e-12)
-                met_gamma = False
+            if len(feasible_experts) > len(candidate_experts):
+                candidate_experts = set(feasible_experts)
+                selected_wlr = self._wdmoe_subtask_wlr(subtask, candidate_experts, latency_vector)
 
+        actual_wlr = self._wdmoe_subtask_wlr(subtask, feasible_experts, latency_vector)
         metrics = {
             "baseline_wlr": baseline_wlr,
-            "selected_wlr": best_wlr,
-            "wlr_ratio": best_wlr / max(baseline_wlr, 1e-12),
+            "selected_wlr": actual_wlr,
+            "wlr_ratio": actual_wlr / max(baseline_wlr, 1e-12),
             "similarity": similarity,
-            "final_threshold": best_theta,
-            "met_gamma": met_gamma,
+            "theta": theta if theta is not None else 0.0,
             "attempted_pruning": attempted_pruning,
-            "pruned": len(best_experts) < len(baseline_experts),
-            "loss_feasible_after_pruning": not (attempted_pruning and len(best_experts) < len(baseline_experts)),
+            "pruned": len(feasible_experts) < len(baseline_experts),
             "baseline_expert_count": len(baseline_experts),
             "selected_expert_count": len(feasible_experts),
         }
@@ -487,7 +545,7 @@ def _run_wdmoe_pipeline(
     kmeans_iterations: int = 20,
     wdmoe_initial_threshold: float = 0.8,
     wdmoe_threshold_step: float = 0.05,
-    wdmoe_max_threshold: float = 0.8,
+    wdmoe_max_threshold: float = 1.0,
     wdmoe_wlr_target_ratio: float = 1.05,
 ) -> ChainedPipelineResult:
     rng = random.Random(random_seed)
@@ -568,13 +626,13 @@ def _run_wdmoe_pipeline(
             "threshold_step_delta": pipeline.wdmoe_threshold_step,
             "max_threshold": pipeline.wdmoe_max_threshold,
             "wlr_target_ratio_gamma": pipeline.wdmoe_wlr_target_ratio,
-            "wlr_scope": "per subtask/node",
+            "wlr_scope": "task graph average over DAG nodes",
             "latency_vector": "predecessor forwarding time + expert inference time",
             "cosine_similarity": "full gating weight vector versus full expert latency vector",
-            "dropped_expert_rule": "per-node adaptation: keep Top-K when similarity > alpha; try K-1 only when similarity <= alpha, then fall back to Top-K if WLR ratio does not pass gamma",
+            "dropped_expert_rule": "paper-style theta search: each theta trial reruns the task graph; nodes with similarity <= theta drop the lowest-gating selected expert once",
             "activation_y_rule": "Y(s,p)=1 if any selected X(i,j,s,p)=1",
             "task_metrics": getattr(pipeline, "wdmoe_task_metrics", {}),
-            "paper_preserving_note": "WDMoE keeps the paper-style pruning rule, does not add cost-aware activation penalties, and does not add extra experts during loss repair",
+            "paper_preserving_note": "WDMoE uses graph-level WLR ratio to choose theta, then the selected experts are passed to the same IoT grouping and backhaul stages",
             "grouping": grouping_name,
         },
         "rsma_parameters": {

@@ -69,8 +69,8 @@ class ChainedPipelineResult:
 
 
 class ChainedComparisonPipeline:
-    allow_expert_loss_repair: bool = True
-    activate_all_candidate_groups: bool = True
+    allow_expert_loss_repair: bool = False
+    activate_all_candidate_groups: bool = False
 
     def __init__(
         self,
@@ -170,6 +170,7 @@ class ChainedComparisonPipeline:
         required_probability: Dict[str, float] = {}
         reconstruction_loss: Dict[str, float] = {}
         performance_loss: Dict[str, float] = {}
+        reported_unavailable_features: Set[Tuple[AssignmentKey, ServerId, str]] = set()
 
         for task in self.tasks.values():
             for subtask in task.subtasks:
@@ -262,26 +263,46 @@ class ChainedComparisonPipeline:
         active_groups: Dict[GroupKey, GroupSpec] = {}
         active_backhaul: Set[BackhaulEdge] = set()
         active_group_budgets: Dict[GroupKey, float] = {}
-        subtask_features: Dict[AssignmentKey, Set[str]] = {}
+        subtask_features: Dict[Tuple[str, str, str], Set[str]] = {}
         required_probability: Dict[str, float] = {}
         reconstruction_loss: Dict[str, float] = {}
         performance_loss: Dict[str, float] = {}
+        reported_unavailable_features: Set[Tuple[AssignmentKey, ServerId, str]] = set()
 
         for task in self.tasks.values():
             for subtask in task.subtasks:
                 key = (task.id, subtask.id)
                 label = self._assignment_label(key)
                 target_servers = self.evaluator.participating_servers(assignments, key)
-                selected_features: Set[str] = set()
                 probability = selected_probability.get(label, 0.0)
                 threshold = self.evaluator.conformal_loss_threshold(subtask)
-                loss = self.evaluator.performance_loss_from_probability(subtask, probability, selected_features)
+
+                self._activate_local_groups_for_subtask(
+                    subtask,
+                    key,
+                    target_servers,
+                    candidate_groups,
+                    active_groups,
+                    active_group_budgets,
+                    subtask_features,
+                    assignments,
+                )
+                avg_rec = self._average_reconstruction_for_servers(subtask, key, target_servers, subtask_features)
+                loss = self.evaluator.performance_loss_from_probability_and_reconstruction(probability, avg_rec)
 
                 while loss > threshold + 1e-12:
-                    group = self._best_group_loss_repair(
+                    self._record_unavailable_missing_features(
                         subtask,
                         key,
-                        selected_features,
+                        target_servers,
+                        subtask_features,
+                        candidate_groups,
+                        reported_unavailable_features,
+                    )
+                    repair = self._best_backhaul_group_loss_repair(
+                        subtask,
+                        key,
+                        subtask_features,
                         probability,
                         threshold,
                         target_servers,
@@ -291,17 +312,20 @@ class ChainedComparisonPipeline:
                         active_group_budgets,
                         assignments,
                     )
-                    if group is None:
+                    if repair is None:
                         break
+                    group, target_server = repair
                     group_key = (group.server_id, group.id)
                     active_groups[group_key] = group
                     group_budget = self._subtask_bandwidth_budget(key, assignments)
                     active_group_budgets[group_key] = min(active_group_budgets.get(group_key, group_budget), group_budget)
-                    for target_server in target_servers:
-                        if group.server_id != target_server:
-                            active_backhaul.add((group.server_id, group.id, target_server))
-                    selected_features.update(group.required_features & subtask.required_features)
-                    loss = self.evaluator.performance_loss_from_probability(subtask, probability, selected_features)
+                    if group.server_id != target_server:
+                        active_backhaul.add((group.server_id, group.id, target_server))
+                    self._server_feature_set(subtask_features, key, target_server).update(
+                        group.required_features & subtask.required_features
+                    )
+                    avg_rec = self._average_reconstruction_for_servers(subtask, key, target_servers, subtask_features)
+                    loss = self.evaluator.performance_loss_from_probability_and_reconstruction(probability, avg_rec)
 
                 while self.allow_expert_loss_repair and loss > threshold + 1e-12:
                     selected_experts = selected_experts_by_key.setdefault(key, set())
@@ -316,24 +340,117 @@ class ChainedComparisonPipeline:
                     self._activate(server_id, expert_id, activated, used_memory)
                     probability += self.evaluator.expert_contribution(subtask, expert_id)
                     selected_probability[label] = probability
-                    loss = self.evaluator.performance_loss_from_probability(subtask, probability, selected_features)
+                    target_servers = self.evaluator.participating_servers(assignments, key)
+                    self._activate_local_groups_for_subtask(
+                        subtask,
+                        key,
+                        target_servers,
+                        candidate_groups,
+                        active_groups,
+                        active_group_budgets,
+                        subtask_features,
+                        assignments,
+                    )
+                    avg_rec = self._average_reconstruction_for_servers(subtask, key, target_servers, subtask_features)
+                    loss = self.evaluator.performance_loss_from_probability_and_reconstruction(probability, avg_rec)
 
                 if loss > threshold + 1e-12:
                     self.scheduler_violations.append(
                         f"Loss repair: {key} loss {loss:.6g} > threshold {threshold:.6g}"
                     )
-                subtask_features[key] = selected_features
-                required_probability[label] = self.evaluator.required_selection_probability(subtask, selected_features)
-                reconstruction_loss[label] = self.evaluator.reconstruction_loss_for_features(subtask, selected_features)
+                required_probability[label] = self._required_probability_with_reconstruction(subtask, avg_rec)
+                reconstruction_loss[label] = avg_rec
                 performance_loss[label] = loss
 
         return list(active_groups.values()), subtask_features, required_probability, reconstruction_loss, performance_loss
 
-    def _best_group_loss_repair(
+    def _server_feature_key(self, key: AssignmentKey, server_id: ServerId) -> Tuple[str, str, str]:
+        return (key[0], key[1], server_id)
+
+    def _server_feature_set(self, subtask_features, key: AssignmentKey, server_id: ServerId) -> Set[str]:
+        return subtask_features.setdefault(self._server_feature_key(key, server_id), set())
+
+    def _activate_local_groups_for_subtask(
         self,
         subtask: SubtaskSpec,
         key: AssignmentKey,
-        selected_features: Set[str],
+        target_servers: Sequence[ServerId],
+        candidate_groups: Sequence[GroupSpec],
+        active_groups: Dict[GroupKey, GroupSpec],
+        active_group_budgets: Dict[GroupKey, float],
+        subtask_features: Dict[Tuple[str, str, str], Set[str]],
+        assignments: Mapping[AssignmentKey, Sequence[Tuple[ServerId, ExpertId]]],
+    ) -> None:
+        group_budget = self._subtask_bandwidth_budget(key, assignments)
+        needed = set(subtask.required_features)
+        for target_server in target_servers:
+            local_groups = [
+                group
+                for group in candidate_groups
+                if group.server_id == target_server and group.required_features & needed
+            ]
+            for group in local_groups:
+                group_key = (group.server_id, group.id)
+                active_groups[group_key] = group
+                active_group_budgets[group_key] = min(active_group_budgets.get(group_key, group_budget), group_budget)
+                self._server_feature_set(subtask_features, key, target_server).update(
+                    group.required_features & needed
+                )
+
+    def _average_reconstruction_for_servers(
+        self,
+        subtask: SubtaskSpec,
+        key: AssignmentKey,
+        target_servers: Sequence[ServerId],
+        subtask_features: Mapping[Tuple[str, str, str], Set[str]],
+    ) -> float:
+        if not target_servers:
+            return subtask.reconstruction_loss
+        losses = []
+        for server_id in target_servers:
+            selected = set(subtask_features.get(self._server_feature_key(key, server_id), set()))
+            losses.append(self.evaluator.reconstruction_loss_for_features(subtask, selected))
+        return sum(losses) / len(losses)
+
+    def _record_unavailable_missing_features(
+        self,
+        subtask: SubtaskSpec,
+        key: AssignmentKey,
+        target_servers: Sequence[ServerId],
+        subtask_features: Mapping[Tuple[str, str, str], Set[str]],
+        candidate_groups: Sequence[GroupSpec],
+        reported: Set[Tuple[AssignmentKey, ServerId, str]],
+    ) -> None:
+        available_features = set()
+        for group in candidate_groups:
+            available_features.update(group.required_features)
+        needed = set(subtask.required_features)
+        for target_server in target_servers:
+            selected = set(subtask_features.get(self._server_feature_key(key, target_server), set()))
+            for feature in sorted(needed - selected):
+                report_key = (key, target_server, feature)
+                if feature in available_features or report_key in reported:
+                    continue
+                reported.add(report_key)
+                self.scheduler_violations.append(
+                    f"Data requirement: feature {feature} needed by {key} on {target_server} "
+                    "is unavailable from all IoT groups"
+                )
+
+    def _required_probability_with_reconstruction(self, subtask: SubtaskSpec, reconstruction_loss: float) -> float:
+        threshold = self.evaluator.conformal_loss_threshold(subtask)
+        if threshold == float("inf"):
+            return 0.0
+        denominator = threshold - (self.config.lambda_reconstruction * reconstruction_loss)
+        if denominator <= 0.0:
+            return float("inf")
+        return 1.0 / denominator
+
+    def _best_backhaul_group_loss_repair(
+        self,
+        subtask: SubtaskSpec,
+        key: AssignmentKey,
+        subtask_features: Mapping[Tuple[str, str, str], Set[str]],
         probability: float,
         threshold: float,
         target_servers: Sequence[ServerId],
@@ -342,39 +459,53 @@ class ChainedComparisonPipeline:
         active_backhaul: Set[BackhaulEdge],
         active_group_budgets: Mapping[GroupKey, float],
         assignments: Mapping[AssignmentKey, Sequence[Tuple[ServerId, ExpertId]]],
-    ) -> Optional[GroupSpec]:
-        missing = set(subtask.required_features) - set(selected_features)
-        if not missing:
-            return None
-        usable = [group for group in candidate_groups if group.required_features & missing]
-        if not usable:
-            return None
-
+    ) -> Optional[Tuple[GroupSpec, ServerId]]:
+        needed = set(subtask.required_features)
         satisfying = []
         improving = []
-        for group in usable:
-            new_features = selected_features | (group.required_features & subtask.required_features)
-            new_loss = self.evaluator.performance_loss_from_probability(subtask, probability, new_features)
-            cost = self._group_incremental_cost(
-                group,
-                key,
-                target_servers,
-                active_groups,
-                active_backhaul,
-                active_group_budgets,
-                assignments,
-            )
-            coverage = len(group.required_features & missing)
-            item = (cost, -coverage, group.server_id, group.id, group)
-            if new_loss <= threshold + 1e-12:
-                satisfying.append(item)
-            else:
-                improving.append((-(coverage / max(cost, 1e-12)), cost, group.server_id, group.id, group))
-
+        current_rec = self._average_reconstruction_for_servers(subtask, key, target_servers, subtask_features)
+        current_loss = self.evaluator.performance_loss_from_probability_and_reconstruction(probability, current_rec)
+        for target_server in target_servers:
+            selected = set(subtask_features.get(self._server_feature_key(key, target_server), set()))
+            missing = needed - selected
+            if not missing:
+                continue
+            usable = [
+                group
+                for group in candidate_groups
+                if group.server_id != target_server and group.required_features & missing
+            ]
+            for group in usable:
+                trial_features = dict((k, set(v)) for k, v in subtask_features.items())
+                trial_features.setdefault(self._server_feature_key(key, target_server), set()).update(
+                    group.required_features & needed
+                )
+                new_rec = self._average_reconstruction_for_servers(subtask, key, target_servers, trial_features)
+                new_loss = self.evaluator.performance_loss_from_probability_and_reconstruction(probability, new_rec)
+                if new_loss >= current_loss - 1e-12:
+                    continue
+                cost = self._group_incremental_cost(
+                    group,
+                    key,
+                    [target_server],
+                    active_groups,
+                    active_backhaul,
+                    active_group_budgets,
+                    assignments,
+                )
+                coverage = len(group.required_features & missing)
+                item = (cost, -coverage, group.server_id, group.id, target_server, group)
+                if new_loss <= threshold + 1e-12:
+                    satisfying.append(item)
+                else:
+                    improvement = current_loss - new_loss
+                    improving.append((-(improvement / max(cost, 1e-12)), cost, group.server_id, group.id, target_server, group))
         if satisfying:
-            return min(satisfying)[-1]
+            item = min(satisfying)
+            return item[-1], item[-2]
         if improving:
-            return min(improving)[-1]
+            item = min(improving)
+            return item[-1], item[-2]
         return None
 
     def _group_incremental_cost(
@@ -495,9 +626,13 @@ class ChainedComparisonPipeline:
         for task in self.tasks.values():
             for subtask in task.subtasks:
                 key = (task.id, subtask.id)
-                features = sorted(subtask_features.get(key, set()))
                 server_map: Dict[ServerId, List[str]] = {}
                 for server_id, _ in assignments.get(key, []):
+                    server_key = (key[0], key[1], server_id)
+                    if server_key in subtask_features:
+                        features = sorted(subtask_features.get(server_key, set()))
+                    else:
+                        features = sorted(subtask_features.get(key, set()))
                     server_map[server_id] = features
                 requirements[self._assignment_label(key)] = server_map
         return requirements
@@ -510,10 +645,12 @@ class ChainedComparisonPipeline:
 
     def _build_distance_groups(self, server_required_features):
         groups: List[GroupSpec] = []
+        globally_required = set()
+        for features in server_required_features.values():
+            globally_required.update(features)
         for server_id in self.servers:
-            assigned_required = set(server_required_features.get(server_id, set()))
             local_devices = [did for did, dev in self.devices.items() if dev.home_server == server_id]
-            local_required = assigned_required & self._server_local_features(local_devices)
+            local_required = globally_required & self._server_local_features(local_devices)
             if not local_required:
                 continue
             candidates = [did for did in local_devices if self.devices[did].features & local_required]
@@ -1010,7 +1147,7 @@ def run_chained_pipeline(
             "num_antennas": num_antennas,
             "max_group_size": max_group_size,
             "min_rate": min_rate,
-            "distance_group_selection_mode": "all_candidate_groups_transmit",
+            "distance_group_selection_mode": "loss_repair_until_bound",
             "loss_threshold": loss_threshold,
             "lambda_reconstruction": lambda_reconstruction,
             "calibration_alpha": calibration_alpha,

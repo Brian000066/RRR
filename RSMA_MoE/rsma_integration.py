@@ -26,6 +26,52 @@ def feature_name(feature_index: int | str) -> str:
 def expert_id(expert_index: int | str) -> str:
     return f"expert_{expert_index}"
 
+
+def feature_index(feature: str) -> int:
+    return int(str(feature).split("_")[-1])
+
+
+def sort_feature_names(features: Iterable[str]) -> list[str]:
+    return sorted(set(features), key=feature_index)
+
+
+def ensure_iot_feature_coverage(
+    devices: list[dict[str, Any]],
+    feature_pool: Sequence[int],
+    server_feature_pools: Mapping[int, Sequence[int]],
+    max_features_per_device: int,
+    rng: random.Random,
+) -> None:
+    if not devices:
+        return
+    covered = {feature_index(feature) for device in devices for feature in device.get("features", [])}
+    missing = [feature for feature in feature_pool if feature not in covered]
+    if not missing:
+        return
+
+    for missing_feature in missing:
+        preferred_servers = {
+            server_index
+            for server_index, pool in server_feature_pools.items()
+            if missing_feature in set(pool)
+        }
+        candidates = [
+            device
+            for device in devices
+            if int(str(device["home_server"]).split("_")[-1]) in preferred_servers
+        ] or devices
+        under_capacity = [
+            device
+            for device in candidates
+            if len(device.get("features", [])) < max_features_per_device
+        ]
+        candidates = under_capacity or candidates
+        rng.shuffle(candidates)
+        target = min(candidates, key=lambda device: len(device.get("features", [])))
+        current = set(target.get("features", []))
+        current.add(feature_name(missing_feature))
+        target["features"] = sort_feature_names(current)
+
 def build_feature_bits(
     num_iot_features: int,
     default_feature_bits: float,
@@ -598,6 +644,14 @@ def build_simple_devices(
                 "max_power": max_power,
             }
         )
+
+    ensure_iot_feature_coverage(
+        devices=devices,
+        feature_pool=feature_pool,
+        server_feature_pools=server_feature_pools,
+        max_features_per_device=max_features,
+        rng=rng,
+    )
 
     for server_index in range(num_servers):
         server_id = f"server_{server_index}"

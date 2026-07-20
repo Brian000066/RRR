@@ -26,11 +26,11 @@ class ExperimentConfig:
     common_dag_spec: DAGSpec = field(
         default_factory=lambda: DAGSpec(
             num_nodes=6,
-            num_branches=4,
+            num_branches=(2,4),
             branch_length_range=(1, 5),
-            depth=5,
+            depth=8,
             max_width=5,
-            edge_probability=0.1,
+            edge_probability=0.2,
             allow_skip_edges=False,
             allow_early_branch_end=True,
             single_source=True,
@@ -43,13 +43,13 @@ class ExperimentConfig:
     expert_memory_range: tuple[float, float] = (128.0, 256.0)
     task_deadline_seconds_range: tuple[int, int] = (30, 120)
     num_iot_features: int = 100
-    iot_features_per_node_range: tuple[int, int] = (1, 3)
+    iot_features_per_node_range: tuple[int, int] = (2, 5)
     gating_peak_count_range: tuple[int, int] = (2, 4)
     gating_peak_mass_range: tuple[float, float] = (0.65, 0.85)
 
     # Performance loss settings.
-    loss_threshold: Optional[float] = 6.0
-    lambda_reconstruction: float = 0.8
+    loss_threshold: Optional[float] = 3.4
+    lambda_reconstruction: float = 1.0
     calibration_alpha: float = 0.1
     reconstruction_sigma: float = 1.0
     reconstruction_error_range: tuple[float, float] = (0.8, 1.5)
@@ -70,11 +70,12 @@ class ExperimentConfig:
     distance_grouping_kmeans_iterations: int = 20
     gssgd_beamforming_gain_threshold: float = 0.0
 
-    # WDMoE pruning settings. Per-node WDMoE uses alpha once: nodes with
-    # similarity above alpha keep Top-K; nodes below alpha try K-1.
-    wdmoe_initial_threshold: float = 0.8
+    # WDMoE pruning settings. Paper-style WDMoE searches theta at task/DAG
+    # scope: each theta trial reruns all subtasks and stops when graph WLR
+    # ratio passes gamma.
+    wdmoe_initial_threshold: float = 0.3
     wdmoe_threshold_step: float = 0.05
-    wdmoe_max_threshold: float = 0.8
+    wdmoe_max_threshold: float = 1.0
     wdmoe_wlr_target_ratio: float = 1.05
 
     # RSMA / edge network settings. These follow the original SIoT-RSMA defaults
@@ -106,4 +107,4 @@ class ExperimentConfig:
     # 5,000 Hz bandwidth gap contributes 500 cost with c_bw=0.1.
     c_bw: float = 0.03
     c_act: float = 20.0
-    c_fwd: float = 3.0
+    c_fwd: float = 2.0

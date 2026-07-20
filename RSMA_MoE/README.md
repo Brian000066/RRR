@@ -118,7 +118,7 @@ Gating network 目前不是平均亂數，而是 peaked distribution：每個 su
 
 | 參數 | 目前值 | 說明 |
 |---|---:|---|
-| `topk_k` | `4` | Top-K baseline 每個 subtask 選 Top-4 experts。WDMoE 會從 Top-K 嘗試 prune 成 K-1。 |
+| `topk_k` | `4` | Top-K baseline selects Top-4 experts per subtask. WDMoE can prune at most one expert per subtask in each theta trial. |
 | `topk_rank_by` | `gating` | Expert ranking 使用 gating weight。Performance probability 仍使用 `gating_weight * expert_confidence`。 |
 | `distance_grouping_clusters_per_server` | `None` | 若為 `None`，K-means 的 K 由 candidate IoT 數量與 `max_group_size` 推出。 |
 | `distance_grouping_kmeans_iterations` | `20` | K-means iteration 次數。 |
@@ -129,11 +129,11 @@ Gating network 目前不是平均亂數，而是 peaked distribution：每個 su
 | 參數 | 目前值 | 說明 |
 |---|---:|---|
 | `wdmoe_initial_threshold` | `0.8` | WDMoE cosine similarity threshold。 |
-| `wdmoe_threshold_step` | `0.05` | 保留參數，目前 per-node 版本不做完整 iterative theta search。 |
-| `wdmoe_max_threshold` | `0.8` | 保留參數，目前等於 initial threshold。 |
-| `wdmoe_wlr_target_ratio` | `1.05` | WDMoE prune 後的 node-level WLR ratio 門檻。 |
+| `wdmoe_threshold_step` | `0.05` | Theta increment used by the paper-style iterative search. |
+| `wdmoe_max_threshold` | `1.0` | Maximum theta value for the iterative search. |
+| `wdmoe_wlr_target_ratio` | `1.05` | Task/graph-level WLR ratio gamma. |
 
-目前 WDMoE 是依照你的環境改成 per-subtask loss bound 版本，不是完整 graph-level Algorithm 1 重跑流程。
+WDMoE now follows the paper-style task/graph-level iterative theta search. Each theta trial reruns all subtasks from the same pre-task state.
 
 ### 2.8 RSMA / Edge Network
 
@@ -186,7 +186,7 @@ y(n,s) = d(n,s) sin(theta(n,s))
 K = ceil(number_of_candidate_IoT / max_group_size)
 ```
 
-6. 分群後所有 candidate groups 都在 task timeline 一開始傳輸。
+6. Candidate groups are generated first; only groups selected by loss repair transmit.
 7. 如果 target server 需要某個 feature，但 feature 只在其他 server 的 group 中，則建立 backhaul edge。
 8. 計算 bandwidth、timing、cost、violations。
 
@@ -210,43 +210,45 @@ K = ceil(number_of_candidate_IoT / max_group_size)
 
 ### 3.3 WDMoE+Distance / WDMoE+GSSGD
 
-WDMoE 只替換 expert selection，後面的 IoT grouping 分別接 Distance 或 GSSGD。
+WDMoE only replaces expert selection. The following IoT grouping stage is still either Distance/K-means or GSSGD DBG.
 
-目前 per-subtask WDMoE 邏輯：
+Current WDMoE logic follows the paper-style Algorithm 1 theta search:
 
-1. 每個 node 先建立普通 Top-K baseline。
-2. 對所有 experts 建 latency vector：
+1. For each DAG/task, run ordinary Top-K over all subtasks to compute the baseline WLR.
+
+```text
+WLR_base(i) = average_{v_j in G_i} average_{p in TopK(v_j)} G_p(v_j^i) / latency_p(v_j^i)
+```
+
+2. Set `theta = wdmoe_initial_threshold`.
+3. Each theta trial clears the temporary selection for the current task and reruns the whole DAG from the same pre-task activation/memory state.
+4. For each node, build the full latency vector:
 
 ```text
 latency_p(v_j^i) = predecessor_forwarding_time + expert_p_inference_time
 ```
 
-3. 計算 node-level baseline WLR：
-
-```text
-WLR_base(i,j) = average_{p in TopK} G_p(v_j^i) / latency_p(v_j^i)
-```
-
-4. 計算 gating vector 與 latency vector 的 cosine similarity：
+5. Compute cosine similarity between the full gating vector and full latency vector:
 
 ```text
 S_j^i = cosine(G(v_j^i), latency(v_j^i))
 ```
 
-5. 若 `S_j^i <= wdmoe_initial_threshold`，嘗試移除 Top-K 中 gating score 最低的 expert。
-6. 計算 prune 後 WLR：
+6. If `S_j^i <= theta`, remove the lowest-gating expert from the current Top-K set. Therefore one subtask can only move from K to K-1 within one theta trial.
+7. After finishing the whole DAG, compute the current task WLR:
 
 ```text
-WLR_current(i,j) = average_{p in selected} G_p(v_j^i) / latency_p(v_j^i)
+WLR_current(i) = average_{v_j in G_i} average_{p in selected(v_j)} G_p(v_j^i) / latency_p(v_j^i)
 ```
 
-7. 若：
+8. Keep the current theta trial when the paper stopping condition is satisfied:
 
 ```text
-WLR_current(i,j) / WLR_base(i,j) > wdmoe_wlr_target_ratio
+WLR_current(i) / WLR_base(i) > wdmoe_wlr_target_ratio
 ```
 
-則保留 K-1；否則 rollback 回 Top-K。
+9. Otherwise set `theta = theta + wdmoe_threshold_step` and rerun the whole DAG until the ratio passes or theta reaches `wdmoe_max_threshold`.
+10. Because this project also has per-node performance-loss bounds, a K-1 pruning is reverted to Top-K if the node cannot satisfy its loss bound even after all required features are available.
 
 ## 4. Performance Loss
 
@@ -547,9 +549,9 @@ B(n,g)=1 if IoT n is in group g, otherwise 0
 2. IoT 只要在 server coverage radius 內就可連線。
 3. IoT feature 與位置正相關，但保留全域隨機 feature，不完全由位置決定。
 4. Group 傳輸單位是整個 IoT group；group 內 IoT 的所有 features 都形成 payload。
-5. Distance grouping 是純 K-means baseline，所有 candidate groups 都傳輸。
+5. Distance grouping is a pure K-means baseline; candidate groups only transmit when selected by performance-loss repair.
 6. GSSGD 只保留 DBG，不使用 DCG。
-7. WDMoE 是 per-subtask adaptation，不是完整 graph-level iterative Algorithm 1。
-8. Bandwidth 是每個 active group 算一次，不對同一 group 重複收費。
+7. WDMoE uses task/graph-level iterative Algorithm 1; each subtask can prune at most one expert in a theta trial.
+8. Bandwidth is charged once per active group; active groups are the groups selected by loss repair.
 9. Forwarding cost 是 event count，不乘 forwarding time。
 10. RSMA rate 使用 SIoT MCS table 與 DB gain。

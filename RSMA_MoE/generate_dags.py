@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -38,7 +38,7 @@ class DAGSpec:
     single_source: bool = True
     single_sink: bool = False
     exact_layer_widths: Optional[list[int]] = None
-    num_branches: Optional[int] = None
+    num_branches: Optional[int | tuple[int, int]] = None
     branch_length_range: Optional[tuple[int, int]] = None
 
 
@@ -64,6 +64,39 @@ def build_dag_specs(num_dags: int, common_spec: DAGSpec) -> list[DAGSpec]:
         )
         for _ in range(num_dags)
     ]
+
+
+def resolve_branch_spec(spec: DAGSpec, rng: random.Random) -> DAGSpec:
+    """Return a branch spec whose num_branches is a concrete integer."""
+    if spec.num_branches is None or isinstance(spec.num_branches, int):
+        return spec
+
+    min_branches, max_branches = spec.num_branches
+    if min_branches < 1:
+        raise ValueError("num_branches range min must be at least 1.")
+    if max_branches < min_branches:
+        raise ValueError("num_branches range must be (min_branches, max_branches).")
+
+    feasible: list[int] = []
+    for branch_count in range(min_branches, max_branches + 1):
+        if spec.num_nodes < branch_count + 1:
+            continue
+        if spec.branch_length_range is None:
+            feasible.append(branch_count)
+            continue
+        min_length, max_length = spec.branch_length_range
+        min_total = 1 + branch_count * min_length
+        max_total = 1 + branch_count * max_length
+        if min_total <= spec.num_nodes <= max_total:
+            feasible.append(branch_count)
+
+    if not feasible:
+        raise ValueError(
+            f"num_nodes={spec.num_nodes} cannot fit num_branches={spec.num_branches} "
+            f"with branch_length_range={spec.branch_length_range}."
+        )
+
+    return replace(spec, num_branches=rng.choice(feasible))
 
 
 def validate_spec(spec: DAGSpec) -> None:
@@ -379,9 +412,10 @@ def generate_dag(
 ) -> nx.DiGraph:
     """Generate one directed acyclic graph."""
     if spec.num_branches is not None:
+        branch_spec = resolve_branch_spec(spec, rng)
         return generate_branch_dag(
             graph_index=graph_index,
-            spec=spec,
+            spec=branch_spec,
             rng=rng,
             num_experts=num_experts,
             num_iot_features=num_iot_features,

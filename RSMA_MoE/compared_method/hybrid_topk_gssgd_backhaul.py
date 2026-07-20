@@ -3,7 +3,7 @@
 Pipeline:
 1. Top-K MoE selects experts and servers for each subtask.
 2. GSSGD DBG phase 1-3 builds local IoT groups under each server.
-3. GSSGD-selected groups transmit from the beginning of the task timeline.
+3. GSSGD builds candidate groups; groups transmit only when needed to repair performance loss.
 4. Backhaul routes selected group data when the assigned server needs it.
 5. The shared formulation evaluator computes timing, constraints, and cost.
 
@@ -43,14 +43,16 @@ from utils.formulation import FormulationConfig, GroupSpec, ServerId  # noqa: E4
 
 class HybridTopKGSSGDBackhaulPipeline(ChainedComparisonPipeline):
     """Hybrid-shaped pipeline whose IoT grouping stage is GSSGD DBG."""
-    activate_all_candidate_groups = True
+    activate_all_candidate_groups = False
 
     def _build_distance_groups(self, server_required_features):
         groups: list[GroupSpec] = []
+        globally_required = set()
+        for features in server_required_features.values():
+            globally_required.update(features)
         for server_id in self.servers:
-            assigned_required = set(server_required_features.get(server_id, set()))
             local_devices = [device_id for device_id, device in self.devices.items() if device.home_server == server_id]
-            local_required = assigned_required & self._server_local_features(local_devices)
+            local_required = globally_required & self._server_local_features(local_devices)
             if not local_required:
                 continue
 
