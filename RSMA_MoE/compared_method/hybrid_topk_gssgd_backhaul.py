@@ -14,7 +14,6 @@ computing code is intentionally not used here.
 from __future__ import annotations
 
 import json
-import random
 import sys
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Set
@@ -26,18 +25,12 @@ if str(BASE_DIR) not in sys.path:
 from compared_method.GSSGD.phase1 import phase1_dbg_selection  # noqa: E402
 from compared_method.GSSGD.phase2 import phase2_dbg_grouping  # noqa: E402
 from compared_method.GSSGD.phase3 import phase3_dbg_refinement  # noqa: E402
-from compared_method.hybrid_topk_distance_backhaul import (  # noqa: E402
+from compared_method.hybrid_topk_location_aware_backhaul import (  # noqa: E402
     ChainedComparisonPipeline,
     ChainedPipelineResult,
     result_to_jsonable as hybrid_result_to_jsonable,
 )
-from rsma_integration import (  # noqa: E402
-    build_feature_bits,
-    build_simple_devices,
-    build_simple_experts,
-    build_simple_servers,
-    graphs_to_tasks,
-)
+from rsma_integration import build_scheduler_inputs  # noqa: E402
 from utils.formulation import FormulationConfig, GroupSpec, ServerId  # noqa: E402
 
 
@@ -139,10 +132,10 @@ def run_hybrid_topk_gssgd_backhaul(
     server_gpu_memory: float = 8192.0,
     server_gpu_memory_range: tuple[float, float] | None = None,
     wired_rate_range: tuple[float, float] | None = None,
+    wired_extra_link_probability: float = 0.05,
     c_bw: float = 1e-3,
     c_act: float = 1.0,
     c_fwd: float = 1.0,
-    bandwidth_time_fraction: float = 1.0,
     default_feature_bits: float = 12000.0,
     wavelength: float = 0.125,
     noise_power: float = 1e-18,
@@ -164,33 +157,36 @@ def run_hybrid_topk_gssgd_backhaul(
     kmeans_iterations: int = 20,
 ) -> ChainedPipelineResult:
     del clusters_per_server, kmeans_iterations
-    rng = random.Random(random_seed)
-    tasks = graphs_to_tasks(graphs, loss_threshold)
-    feature_bits_by_name = build_feature_bits(num_iot_features, default_feature_bits, feature_bits_range, rng)
-    experts = build_simple_experts(num_experts, memory_range=expert_memory_range, rng=rng)
-    servers = build_simple_servers(
-        num_servers=num_servers,
-        experts=experts,
-        experts_per_server=experts_per_server,
-        gpu_memory=server_gpu_memory,
-        gpu_memory_range=server_gpu_memory_range,
-        wired_rate_range=wired_rate_range,
-        rng=rng,
-    )
-    devices, topology = build_simple_devices(
+    inputs = build_scheduler_inputs(
+        graphs=graphs,
+        num_experts=num_experts,
         num_iot_features=num_iot_features,
-        num_iot_devices=num_iot_devices,
+        expert_memory_range=expert_memory_range,
+        feature_bits_range=feature_bits_range,
         num_servers=num_servers,
+        num_iot_devices=num_iot_devices,
         features_per_device_range=features_per_device_range,
         server_feature_overlap_ratio=server_feature_overlap_ratio,
         global_random_feature_fraction=global_random_feature_fraction,
+        experts_per_server=experts_per_server,
+        server_gpu_memory=server_gpu_memory,
+        server_gpu_memory_range=server_gpu_memory_range,
+        wired_rate_range=wired_rate_range,
+        wired_extra_link_probability=wired_extra_link_probability,
+        default_feature_bits=default_feature_bits,
+        max_device_power=max_device_power,
         area_size=area_size,
         cell_radius=cell_radius,
         num_antennas=num_antennas,
-        rng=rng,
-        max_power=max_device_power,
+        loss_threshold=loss_threshold,
+        random_seed=random_seed,
     )
-
+    tasks = inputs.tasks
+    feature_bits_by_name = inputs.feature_bits_by_name
+    experts = inputs.experts
+    servers = inputs.servers
+    devices = inputs.devices
+    topology = inputs.topology
     pipeline = HybridTopKGSSGDBackhaulPipeline(
         servers=servers,
         devices=devices,
@@ -198,6 +194,7 @@ def run_hybrid_topk_gssgd_backhaul(
         tasks=tasks,
         top_k=top_k,
         rank_by=rank_by,
+        placement_random_seed=random_seed,
         config=FormulationConfig(
             max_group_size=max_group_size,
             min_rate=min_rate,
@@ -206,7 +203,6 @@ def run_hybrid_topk_gssgd_backhaul(
             c_act=c_act,
             c_fwd=c_fwd,
             derive_bandwidth=True,
-            bandwidth_time_fraction=bandwidth_time_fraction,
             noise_power=noise_power,
             common_power_ratio=common_power_ratio,
             default_power=max_device_power,
@@ -243,8 +239,8 @@ def run_hybrid_topk_gssgd_backhaul(
             "experts_per_server": experts_per_server,
             "server_gpu_memory_range": server_gpu_memory_range,
             "wired_rate_range": wired_rate_range,
+            "wired_extra_link_probability": wired_extra_link_probability,
             "bandwidth_mode": "derived_by_group_slack",
-            "bandwidth_time_fraction": bandwidth_time_fraction,
             "default_feature_bits": default_feature_bits,
             "feature_bits_range": feature_bits_range,
             "feature_bits_by_name": feature_bits_by_name,
@@ -276,6 +272,11 @@ def run_hybrid_topk_gssgd_backhaul(
             indent=2,
         )
     return result
+
+
+
+
+
 
 
 

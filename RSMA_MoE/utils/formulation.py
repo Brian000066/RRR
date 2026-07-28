@@ -29,6 +29,7 @@ class ServerSpec:
     stored_experts: Set[ExpertId] = field(default_factory=set)
     covered_devices: Set[DeviceId] = field(default_factory=set)
     wired_rates: Dict[ServerId, float] = field(default_factory=dict)
+    wired_weights: Dict[ServerId, float] = field(default_factory=dict)
     active_experts: Set[ExpertId] = field(default_factory=set)
 
 
@@ -56,7 +57,6 @@ class SubtaskSpec:
     gating_weights: Tuple[float, ...] = field(default_factory=tuple)
     expert_confidence: Tuple[float, ...] = field(default_factory=tuple)
     reconstruction_loss: float = 0.0
-    reconstruction_error_by_feature: Dict[str, float] = field(default_factory=dict)
     calibration_losses: Tuple[float, ...] = field(default_factory=tuple)
     loss_threshold: Optional[float] = None
     max_loss: Optional[float] = None
@@ -86,7 +86,6 @@ class FormulationConfig:
     c_act: float = 1.0
     c_fwd: float = 1.0
     derive_bandwidth: bool = True
-    bandwidth_time_fraction: float = 1.0
     default_channel_gain: float = 1.0
     default_power: float = 1.0
     common_power_ratio: float = 0.6
@@ -255,6 +254,7 @@ def normalize_servers(servers: Iterable[Any]) -> Dict[ServerId, ServerSpec]:
             stored_experts=as_set(_first(data, ("stored_experts", "existing_experts", "experts"), set())),
             covered_devices=as_set(_first(data, ("device_ids", "covered_devices", "coverage"), set())),
             wired_rates={str(k): float(v) for k, v in dict(data.get("wired_rates", {})).items()},
+            wired_weights={str(k): float(v) for k, v in dict(data.get("wired_weights", {})).items()},
             active_experts=as_set(_first(data, ("active_experts", "activated_expert"), set())),
         )
     return normalized
@@ -316,7 +316,6 @@ def normalize_tasks(tasks: Iterable[Any]) -> Dict[TaskId, TaskSpec]:
                     gating_weights=tuple(float(value) for value in _first(sub, ("gating_weights", "gating"), [])),
                     expert_confidence=tuple(float(value) for value in _first(sub, ("expert_confidence", "pi"), [])),
                     reconstruction_loss=float(_first(sub, ("reconstruction_loss", "L_rec"), 0.0)),
-                    reconstruction_error_by_feature={},
                     calibration_losses=tuple(float(value) for value in _first(sub, ("calibration_losses", "D_cal"), [])),
                     loss_threshold=_first(sub, ("loss_threshold", "q", "q_hat"), None),
                     max_loss=_first(sub, ("max_loss", "loss"), None),
@@ -383,12 +382,12 @@ class FormulationEvaluator:
                     for src_server in self.participating_servers(assignments, pred_key):
                         for dst_server in self.participating_servers(assignments, child_key):
                             if src_server != dst_server:
-                                forwarding_cost += self.config.c_fwd
+                                forwarding_cost += self.config.c_fwd * self.wired_weight(src_server, dst_server)
 
         for src_server, group_id, dst_server in backhaul:
             group = next((g for g in groups if g.server_id == src_server and g.id == group_id), None)
             if group and src_server != dst_server:
-                forwarding_cost += self.config.c_fwd
+                forwarding_cost += self.config.c_fwd * self.wired_weight(src_server, dst_server)
 
         return ObjectiveBreakdown(activation_cost, forwarding_cost, bandwidth_cost)
 
@@ -421,7 +420,7 @@ class FormulationEvaluator:
         ]
         if not finite_deadlines:
             return 1.0
-        return max(min(finite_deadlines) * self.config.bandwidth_time_fraction, 1e-12)
+        return max(min(finite_deadlines), 1e-12)
 
     def group_bandwidth_budgets(
         self,
@@ -778,6 +777,11 @@ class FormulationEvaluator:
             return float("inf")
         return self.servers.get(src, ServerSpec(src, 0)).wired_rates.get(dst, 1e9)
 
+    def wired_weight(self, src: ServerId, dst: ServerId) -> float:
+        if src == dst:
+            return 0.0
+        return self.servers.get(src, ServerSpec(src, 0)).wired_weights.get(dst, 1.0)
+
     def channel_gain(self, device_id: DeviceId, server_id: ServerId) -> float:
         vector = self.devices[device_id].channel_vector.get(server_id, tuple())
         if vector:
@@ -1034,11 +1038,20 @@ class FormulationEvaluator:
         target_servers = self.participating_servers(assignments, key)
         if not target_servers:
             return subtask.reconstruction_loss
-        losses = []
+
+        weighted_loss = 0.0
+        total_experts = 0
         for server_id in target_servers:
+            expert_count = len(self.selected_experts_on_server(assignments, key, server_id))
+            if expert_count <= 0:
+                continue
             selected = None if subtask_features is None else self.features_for_server(subtask_features, key, server_id)
-            losses.append(self.reconstruction_loss_for_features(subtask, selected))
-        return sum(losses) / len(losses)
+            server_loss = self.reconstruction_loss_for_features(subtask, selected)
+            weighted_loss += expert_count * server_loss
+            total_experts += expert_count
+        if total_experts <= 0:
+            return subtask.reconstruction_loss
+        return weighted_loss / total_experts
 
     def performance_loss_from_probability_and_reconstruction(
         self,
@@ -1078,13 +1091,15 @@ class FormulationEvaluator:
         subtask: SubtaskSpec,
         selected_features: Optional[Set[str]],
     ) -> float:
-        if selected_features is None:
-            return subtask.reconstruction_loss
-        total_features = max(len(subtask.required_features), 1)
-        missing_count = len(set(subtask.required_features) - set(selected_features))
+        required_features = set(subtask.required_features)
+        if not required_features:
+            return 0.0
+        selected = set() if selected_features is None else set(selected_features)
+        missing_count = len(required_features - selected)
         if missing_count <= 0:
             return 0.0
-        return subtask.reconstruction_loss * (missing_count / total_features)
+        sigma_sq = max(self.config.reconstruction_sigma ** 2, 1e-12)
+        return missing_count / (2.0 * sigma_sq)
 
     def performance_loss_from_probability(
         self,

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import math
-import random
 import sys
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Set
@@ -19,19 +18,13 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from compared_method.hybrid_topk_distance_backhaul import (  # noqa: E402
+from compared_method.hybrid_topk_location_aware_backhaul import (  # noqa: E402
     ChainedComparisonPipeline,
     ChainedPipelineResult,
     result_to_jsonable as hybrid_result_to_jsonable,
 )
 from compared_method.hybrid_topk_gssgd_backhaul import HybridTopKGSSGDBackhaulPipeline  # noqa: E402
-from rsma_integration import (  # noqa: E402
-    build_feature_bits,
-    build_simple_devices,
-    build_simple_experts,
-    build_simple_servers,
-    graphs_to_tasks,
-)
+from rsma_integration import build_scheduler_inputs  # noqa: E402
 from utils.formulation import AssignmentKey, ExpertId, FormulationConfig, ServerId  # noqa: E402
 
 
@@ -350,21 +343,14 @@ class WDMoEExpertSelectionMixin:
         used_memory,
     ) -> Dict[ExpertId, float]:
         latencies: Dict[ExpertId, float] = {}
+        merged = dict(committed_assignments)
+        merged.update(task_assignments)
         for expert_id in self.experts:
-            server_id = self._best_server_for_expert_with_predecessors(
-                expert_id=expert_id,
-                task=task,
-                subtask=subtask,
-                committed_assignments=committed_assignments,
-                task_assignments=task_assignments,
-                activated=activated,
-                used_memory=used_memory,
-            )
-            if server_id is None:
+            feasible_servers = self._wdmoe_feasible_servers_for_expert(expert_id, activated, used_memory)
+            if not feasible_servers:
                 latencies[expert_id] = 1e6
                 continue
-            merged = dict(committed_assignments)
-            merged.update(task_assignments)
+            server_id = feasible_servers[0]
             latencies[expert_id] = (
                 self._wdmoe_predecessor_forwarding_time(task, subtask, server_id, merged, {})
                 + self.experts[expert_id].latency
@@ -383,6 +369,20 @@ class WDMoEExpertSelectionMixin:
             return 1.0
         return sum(w * t for w, t in zip(weights, latencies)) / (weight_norm * latency_norm)
 
+    def _wdmoe_feasible_servers_for_expert(self, expert_id, activated, used_memory) -> list[ServerId]:
+        expert = self.experts[expert_id]
+        feasible: list[ServerId] = []
+        for server_id in sorted(self.servers):
+            server = self.servers[server_id]
+            if expert_id not in server.stored_experts:
+                continue
+            memory_after = used_memory.get(server_id, 0.0)
+            if expert_id not in activated.get(server_id, set()):
+                memory_after += expert.memory
+            if memory_after <= server.gpu_memory:
+                feasible.append(server_id)
+        return feasible
+
     def _best_server_for_expert_with_predecessors(
         self,
         expert_id,
@@ -393,23 +393,10 @@ class WDMoEExpertSelectionMixin:
         activated,
         used_memory,
     ):
-        expert = self.experts[expert_id]
-        merged = dict(committed_assignments)
-        merged.update(task_assignments)
-        best = None
-        for server_id, server in self.servers.items():
-            if expert_id not in server.stored_experts:
-                continue
-            memory_after = used_memory.get(server_id, 0.0)
-            if expert_id not in activated.get(server_id, set()):
-                memory_after += expert.memory
-            if memory_after > server.gpu_memory:
-                continue
-            pred_forward = self._wdmoe_predecessor_forwarding_time(task, subtask, server_id, merged, {})
-            score = pred_forward + expert.latency
-            if best is None or score < best[0]:
-                best = (score, server_id)
-        return None if best is None else best[1]
+        feasible_servers = self._wdmoe_feasible_servers_for_expert(expert_id, activated, used_memory)
+        if not feasible_servers:
+            return None
+        return self.placement_rng.choice(feasible_servers)
 
     def _best_wdmoe_loss_repair_candidate(
         self,
@@ -421,29 +408,22 @@ class WDMoEExpertSelectionMixin:
         activated,
         used_memory,
     ):
-        merged = dict(committed_assignments)
-        merged.update(task_assignments)
-        best = None
-        for server_id, server in self.servers.items():
-            for expert_id in server.stored_experts:
-                if expert_id in selected_experts:
-                    continue
-                contribution = self.evaluator.expert_contribution(subtask, expert_id)
-                if contribution <= 0.0:
-                    continue
-                expert = self.experts[expert_id]
-                memory_after = used_memory.get(server_id, 0.0)
-                activation_penalty = 0.0
-                if expert_id not in activated.get(server_id, set()):
-                    memory_after += expert.memory
-                    activation_penalty = self.config.c_act
-                if memory_after > server.gpu_memory:
-                    continue
-                pred_forward = self._wdmoe_predecessor_forwarding_time(task, subtask, server_id, merged, {})
-                score = (-contribution, activation_penalty, pred_forward + expert.latency, server_id, expert_id)
-                if best is None or score < best[0]:
-                    best = (score, server_id, expert_id)
-        return None if best is None else (best[1], best[2])
+        candidates = []
+        for expert_id in sorted(self.experts):
+            if expert_id in selected_experts:
+                continue
+            contribution = self.evaluator.expert_contribution(subtask, expert_id)
+            if contribution <= 0.0:
+                continue
+            feasible_servers = self._wdmoe_feasible_servers_for_expert(expert_id, activated, used_memory)
+            if not feasible_servers:
+                continue
+            expert = self.experts[expert_id]
+            candidates.append((-contribution, expert.latency, expert_id, feasible_servers))
+        if not candidates:
+            return None
+        _, _, expert_id, feasible_servers = min(candidates, key=lambda item: (item[0], item[1], item[2]))
+        return self.placement_rng.choice(feasible_servers), expert_id
 
     def _wdmoe_predecessor_forwarding_time(self, task, subtask, target_server, assignments, finish_cache) -> float:
         ready = 0.0
@@ -492,8 +472,8 @@ class WDMoEExpertSelectionMixin:
         return next((subtask for subtask in task.subtasks if subtask.id == subtask_id), None)
 
 
-class WDMoEDistancePipeline(WDMoEExpertSelectionMixin, ChainedComparisonPipeline):
-    """WDMoE expert selection + distance/K-means IoT grouping."""
+class WDMoELocationAwarePipeline(WDMoEExpertSelectionMixin, ChainedComparisonPipeline):
+    """WDMoE expert selection + location_aware/K-means IoT grouping."""
 
 
 class WDMoEGSSGDPipeline(WDMoEExpertSelectionMixin, HybridTopKGSSGDBackhaulPipeline):
@@ -520,10 +500,10 @@ def _run_wdmoe_pipeline(
     server_gpu_memory: float = 8192.0,
     server_gpu_memory_range: tuple[float, float] | None = None,
     wired_rate_range: tuple[float, float] | None = None,
+    wired_extra_link_probability: float = 0.05,
     c_bw: float = 1e-3,
     c_act: float = 1.0,
     c_fwd: float = 1.0,
-    bandwidth_time_fraction: float = 1.0,
     default_feature_bits: float = 12000.0,
     wavelength: float = 0.125,
     noise_power: float = 1e-18,
@@ -548,32 +528,36 @@ def _run_wdmoe_pipeline(
     wdmoe_max_threshold: float = 1.0,
     wdmoe_wlr_target_ratio: float = 1.05,
 ) -> ChainedPipelineResult:
-    rng = random.Random(random_seed)
-    tasks = graphs_to_tasks(graphs, loss_threshold)
-    feature_bits_by_name = build_feature_bits(num_iot_features, default_feature_bits, feature_bits_range, rng)
-    experts = build_simple_experts(num_experts, memory_range=expert_memory_range, rng=rng)
-    servers = build_simple_servers(
-        num_servers=num_servers,
-        experts=experts,
-        experts_per_server=experts_per_server,
-        gpu_memory=server_gpu_memory,
-        gpu_memory_range=server_gpu_memory_range,
-        wired_rate_range=wired_rate_range,
-        rng=rng,
-    )
-    devices, topology = build_simple_devices(
+    inputs = build_scheduler_inputs(
+        graphs=graphs,
+        num_experts=num_experts,
         num_iot_features=num_iot_features,
-        num_iot_devices=num_iot_devices,
+        expert_memory_range=expert_memory_range,
+        feature_bits_range=feature_bits_range,
         num_servers=num_servers,
+        num_iot_devices=num_iot_devices,
         features_per_device_range=features_per_device_range,
         server_feature_overlap_ratio=server_feature_overlap_ratio,
         global_random_feature_fraction=global_random_feature_fraction,
+        experts_per_server=experts_per_server,
+        server_gpu_memory=server_gpu_memory,
+        server_gpu_memory_range=server_gpu_memory_range,
+        wired_rate_range=wired_rate_range,
+        wired_extra_link_probability=wired_extra_link_probability,
+        default_feature_bits=default_feature_bits,
+        max_device_power=max_device_power,
         area_size=area_size,
         cell_radius=cell_radius,
         num_antennas=num_antennas,
-        rng=rng,
-        max_power=max_device_power,
+        loss_threshold=loss_threshold,
+        random_seed=random_seed,
     )
+    tasks = inputs.tasks
+    feature_bits_by_name = inputs.feature_bits_by_name
+    experts = inputs.experts
+    servers = inputs.servers
+    devices = inputs.devices
+    topology = inputs.topology
     pipeline = pipeline_cls(
         servers=servers,
         devices=devices,
@@ -583,6 +567,7 @@ def _run_wdmoe_pipeline(
         rank_by=rank_by,
         clusters_per_server=clusters_per_server,
         kmeans_iterations=kmeans_iterations,
+        placement_random_seed=random_seed,
         config=FormulationConfig(
             max_group_size=max_group_size,
             min_rate=min_rate,
@@ -591,7 +576,6 @@ def _run_wdmoe_pipeline(
             c_act=c_act,
             c_fwd=c_fwd,
             derive_bandwidth=True,
-            bandwidth_time_fraction=bandwidth_time_fraction,
             noise_power=noise_power,
             common_power_ratio=common_power_ratio,
             default_power=max_device_power,
@@ -643,8 +627,8 @@ def _run_wdmoe_pipeline(
             "experts_per_server": experts_per_server,
             "server_gpu_memory_range": server_gpu_memory_range,
             "wired_rate_range": wired_rate_range,
+            "wired_extra_link_probability": wired_extra_link_probability,
             "bandwidth_mode": "derived_by_group_slack",
-            "bandwidth_time_fraction": bandwidth_time_fraction,
             "default_feature_bits": default_feature_bits,
             "feature_bits_range": feature_bits_range,
             "feature_bits_by_name": feature_bits_by_name,
@@ -676,15 +660,15 @@ def _run_wdmoe_pipeline(
     return result
 
 
-def run_wdmoe_distance(
+def run_wdmoe_location_aware(
     graphs: Sequence[Any],
     output_path: Path,
     **kwargs: Any,
 ) -> ChainedPipelineResult:
     return _run_wdmoe_pipeline(
-        WDMoEDistancePipeline,
-        "wdmoe_distance",
-        "Distance/K-means IoT grouping",
+        WDMoELocationAwarePipeline,
+        "wdmoe_location_aware",
+        "location_aware/K-means IoT grouping",
         graphs,
         output_path,
         **kwargs,
@@ -704,6 +688,14 @@ def run_wdmoe_gssgd(
         output_path,
         **kwargs,
     )
+
+
+
+
+
+
+
+
 
 
 

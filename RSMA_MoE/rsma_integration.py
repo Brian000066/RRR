@@ -1,22 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import math
 import random
-import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 import networkx as nx
 
-
-BASE_DIR = Path(__file__).resolve().parent
-RSMA_DIR = BASE_DIR / "26_rsma_network_2026"
-if str(RSMA_DIR) not in sys.path:
-    sys.path.insert(0, str(RSMA_DIR))
-
-from jrgep_scheduler_standalone import JRGEPScheduler  # noqa: E402
-from utils.formulation import FormulationConfig  # noqa: E402
 
 
 def feature_name(feature_index: int | str) -> str:
@@ -257,6 +249,88 @@ def build_simple_experts(
     return experts
 
 
+
+def build_physical_wired_shortest_paths(
+    num_servers: int,
+    rate_min: float,
+    rate_max: float,
+    rng: random.Random,
+    extra_link_probability: float = 0.25,
+) -> tuple[dict[int, dict[int, float]], dict[int, dict[int, float]], list[dict[str, Any]]]:
+    """Build a connected physical MEC graph and derive shortest-route rates.
+
+    The logical wired connection between any two servers follows the
+    predetermined shortest physical route. The route weight is its hop count,
+    and the effective end-to-end rate is the bottleneck rate along that route.
+    """
+    if num_servers < 1:
+        return {}, {}, []
+
+    links: dict[tuple[int, int], float] = {}
+
+    def add_link(left: int, right: int) -> None:
+        if left == right:
+            return
+        key = (min(left, right), max(left, right))
+        if key not in links:
+            links[key] = rng.uniform(rate_min, rate_max)
+
+    if num_servers == 1:
+        return {0: {}}, {0: {}}, []
+
+    # Ring links guarantee connectivity; random chords create heterogeneous routes.
+    for index in range(num_servers):
+        add_link(index, (index + 1) % num_servers)
+    for left in range(num_servers):
+        for right in range(left + 2, num_servers):
+            if num_servers > 3 and left == 0 and right == num_servers - 1:
+                continue
+            if rng.random() < extra_link_probability:
+                add_link(left, right)
+
+    hops = [[math.inf for _ in range(num_servers)] for _ in range(num_servers)]
+    bottleneck = [[0.0 for _ in range(num_servers)] for _ in range(num_servers)]
+    for index in range(num_servers):
+        hops[index][index] = 0
+        bottleneck[index][index] = math.inf
+    for (left, right), rate in links.items():
+        hops[left][right] = hops[right][left] = 1
+        bottleneck[left][right] = bottleneck[right][left] = rate
+
+    for mid in range(num_servers):
+        for src in range(num_servers):
+            if hops[src][mid] == math.inf:
+                continue
+            for dst in range(num_servers):
+                if hops[mid][dst] == math.inf:
+                    continue
+                candidate_hops = hops[src][mid] + hops[mid][dst]
+                candidate_rate = min(bottleneck[src][mid], bottleneck[mid][dst])
+                if (
+                    candidate_hops < hops[src][dst]
+                    or (
+                        candidate_hops == hops[src][dst]
+                        and candidate_rate > bottleneck[src][dst]
+                    )
+                ):
+                    hops[src][dst] = candidate_hops
+                    bottleneck[src][dst] = candidate_rate
+
+    wired_rates: dict[int, dict[int, float]] = {index: {} for index in range(num_servers)}
+    wired_weights: dict[int, dict[int, float]] = {index: {} for index in range(num_servers)}
+    for src in range(num_servers):
+        for dst in range(num_servers):
+            if src == dst:
+                continue
+            wired_rates[src][dst] = bottleneck[src][dst] if bottleneck[src][dst] > 0.0 else rate_min
+            wired_weights[src][dst] = float(hops[src][dst] if hops[src][dst] != math.inf else num_servers)
+
+    link_list = [
+        {"src": f"server_{left}", "dst": f"server_{right}", "rate": rate}
+        for (left, right), rate in sorted(links.items())
+    ]
+    return wired_rates, wired_weights, link_list
+
 def build_simple_servers(
     num_servers: int,
     experts: Mapping[str, Mapping[str, Any]],
@@ -264,39 +338,77 @@ def build_simple_servers(
     gpu_memory: float = 8192.0,
     gpu_memory_range: tuple[float, float] | None = None,
     wired_rate_range: tuple[float, float] | None = None,
+    wired_extra_link_probability: float = 0.05,
     rng: random.Random | None = None,
 ) -> list[dict[str, Any]]:
-    """Create edge servers with globally unique expert storage and random wired links."""
+    """Create edge servers with balanced expert replicas and random wired links."""
     if num_servers < 1:
         raise ValueError("num_servers must be at least 1.")
     if experts_per_server < 1:
         raise ValueError("experts_per_server must be at least 1.")
 
+    rng = rng or random.Random()
     expert_ids = sorted(experts, key=lambda item: int(item.rsplit("_", 1)[1]))
+    if not expert_ids:
+        raise ValueError("at least one expert is required.")
+
     experts_per_server = min(experts_per_server, len(expert_ids))
     total_slots = num_servers * experts_per_server
-    if len(expert_ids) > total_slots:
-        raise ValueError(
-            "not enough server expert slots for unique expert storage: "
-            f"{len(expert_ids)} experts > {total_slots} slots"
-        )
-
     experts_by_server: list[list[str]] = [[] for _ in range(num_servers)]
-    for expert_offset, stored_expert_id in enumerate(expert_ids):
+    replica_count = {expert_id_value: 0 for expert_id_value in expert_ids}
+
+    def server_has_room(server_index: int) -> bool:
+        return len(experts_by_server[server_index]) < experts_per_server
+
+    def place_expert(server_index: int, expert_id_value: str) -> None:
+        experts_by_server[server_index].append(expert_id_value)
+        replica_count[expert_id_value] += 1
+
+    # First pass: keep as many experts available as possible. If there are
+    # enough slots, every expert gets one copy before replicas are added.
+    for expert_offset, stored_expert_id in enumerate(expert_ids[:total_slots]):
         start_server = expert_offset % num_servers
         for hop in range(num_servers):
             server_index = (start_server + hop) % num_servers
-            if len(experts_by_server[server_index]) < experts_per_server:
-                experts_by_server[server_index].append(stored_expert_id)
+            if server_has_room(server_index) and stored_expert_id not in experts_by_server[server_index]:
+                place_expert(server_index, stored_expert_id)
                 break
 
-    rng = rng or random.Random()
+    # Second pass: fill remaining slots with random replicas. A server cannot
+    # store the same expert twice, but the same expert may appear on different servers.
+    max_replicas_per_expert = max(1, math.ceil(total_slots / len(expert_ids)) + 1)
+    for server_index in rng.sample(range(num_servers), num_servers):
+        while server_has_room(server_index):
+            candidates = [
+                expert_id_value
+                for expert_id_value in expert_ids
+                if expert_id_value not in experts_by_server[server_index]
+                and replica_count[expert_id_value] < max_replicas_per_expert
+            ]
+            if not candidates:
+                candidates = [
+                    expert_id_value
+                    for expert_id_value in expert_ids
+                    if expert_id_value not in experts_by_server[server_index]
+                ]
+            if not candidates:
+                break
+            place_expert(server_index, rng.choice(candidates))
+
     gpu_min, gpu_max = normalize_float_range(gpu_memory_range, (gpu_memory, gpu_memory), "server_gpu_memory_range")
     rate_min, rate_max = wired_rate_range or (1e9, 1e9)
     if rate_min <= 0.0 or rate_max <= 0.0:
         raise ValueError("wired rates must be positive.")
     if rate_min > rate_max:
         rate_min, rate_max = rate_max, rate_min
+
+    wired_rates, wired_weights, physical_links = build_physical_wired_shortest_paths(
+        num_servers,
+        rate_min,
+        rate_max,
+        rng,
+        extra_link_probability=wired_extra_link_probability,
+    )
 
     servers: list[dict[str, Any]] = []
     for server_index, stored in enumerate(experts_by_server):
@@ -308,10 +420,16 @@ def build_simple_servers(
                 "stored_experts": stored,
                 "active_experts": [],
                 "wired_rates": {
-                    f"server_{other}": rng.uniform(rate_min, rate_max)
+                    f"server_{other}": wired_rates[server_index][other]
                     for other in range(num_servers)
                     if other != server_index
                 },
+                "wired_weights": {
+                    f"server_{other}": wired_weights[server_index][other]
+                    for other in range(num_servers)
+                    if other != server_index
+                },
+                "physical_wired_links": physical_links,
             }
         )
     return servers
@@ -470,47 +588,14 @@ def spatial_feature_set(
     sector_count: int = 8,
     ring_count: int = 3,
 ) -> set[int]:
-    """Assign feature indexes with positive, imperfect correlation to IoT position."""
+    """Assign feature indexes from the home server's local feature pool."""
     if feature_count <= 0:
         return set()
 
-    global_random_fraction = min(max(global_random_fraction, 0.0), 1.0)
-    local_target = max(1, round(feature_count * (1.0 - global_random_fraction)))
-    sector_index = int((home_angle / (2.0 * math.pi)) * sector_count) % sector_count
-    distance_ratio = min(max(home_distance / max(cell_radius, 1e-12), 0.0), 0.999999)
-    ring_index = int(distance_ratio * ring_count)
-
-    overlap_pool: set[int] = set()
-    for server_index in connected_server_indices:
-        if server_index != home_server_index:
-            overlap_pool.update(server_feature_pools.get(server_index, []))
-
     features: set[int] = set()
-    fill_features_from_pool(
-        features,
-        sector_feature_pools.get((home_server_index, sector_index), []),
-        max(1, round(feature_count * 0.35)),
-        rng,
-    )
-    fill_features_from_pool(
-        features,
-        ring_feature_pools.get((home_server_index, ring_index), []),
-        max(len(features), round(feature_count * 0.55)),
-        rng,
-    )
-    fill_features_from_pool(
-        features,
-        sorted(overlap_pool),
-        max(len(features), round(feature_count * 0.70)),
-        rng,
-    )
-    fill_features_from_pool(
-        features,
-        server_feature_pools.get(home_server_index, []),
-        max(len(features), local_target),
-        rng,
-    )
-    fill_features_from_pool(features, feature_pool, feature_count, rng)
+    fill_features_from_pool(features, server_feature_pools.get(home_server_index, []), feature_count, rng)
+    if len(features) < min(feature_count, len(feature_pool)):
+        fill_features_from_pool(features, feature_pool, feature_count, rng)
     return set(sorted(features))
 
 
@@ -702,34 +787,20 @@ def build_simple_devices(
     return devices, topology
 
 
-def result_to_jsonable(result: Any, network_context: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    evaluation = result.evaluation
-    payload = {
-        "objective": {
-            "total_cost": int(result.total_cost + 0.5),
-            "activation_cost": int(result.activation_cost + 0.5),
-            "bandwidth_cost": int(result.bandwidth_cost + 0.5),
-            "forwarding_cost": int(result.forwarding_cost + 0.5),
-        },
-        "expert_placement": result.expert_placement,
-        "subtask_assignment": {
-            f"{task_id}:{subtask_id}": pairs
-            for (task_id, subtask_id), pairs in result.subtask_assignment.items()
-        },
-        "rsma_groups": result.rsma_groups,
-        "rsma_group_bandwidths": result.rsma_group_bandwidths,
-        "backhaul": [list(item) for item in sorted(result.backhaul)],
-        "violations": result.violations,
-        "task_finish_time": evaluation.timing.task_finish_time if evaluation else {},
-    }
-    if network_context is not None:
-        payload["network_model"] = dict(network_context)
-    return payload
 
 
-def run_rsma_scheduler(
+@dataclass(frozen=True)
+class SchedulerInputs:
+    tasks: list[dict[str, Any]]
+    feature_bits_by_name: dict[str, float]
+    experts: dict[str, dict[str, float | int]]
+    servers: list[dict[str, Any]]
+    devices: list[dict[str, Any]]
+    topology: dict[str, Any]
+
+
+def build_scheduler_inputs(
     graphs: Sequence[nx.DiGraph],
-    output_path: Path,
     num_experts: int,
     num_iot_features: int,
     expert_memory_range: tuple[float, float] | None = None,
@@ -743,27 +814,16 @@ def run_rsma_scheduler(
     server_gpu_memory: float = 8192.0,
     server_gpu_memory_range: tuple[float, float] | None = None,
     wired_rate_range: tuple[float, float] | None = None,
-    c_bw: float = 1e-3,
-    c_act: float = 1.0,
-    c_fwd: float = 1.0,
-    bandwidth_time_fraction: float = 1.0,
+    wired_extra_link_probability: float = 0.05,
     default_feature_bits: float = 12000.0,
-    wavelength: float = 0.125,
-    noise_power: float = 1e-18,
-    common_power_ratio: float = 0.6,
     max_device_power: float = 1.2589e-3,
     area_size: float = 1000.0,
     cell_radius: float = 300.0,
     num_antennas: int = 4,
     loss_threshold: float | None = None,
-    lambda_reconstruction: float = 0.1,
-    calibration_alpha: float = 0.1,
     random_seed: int = 42,
-    max_group_size: int = 5,
-    min_rate: float = 1.0,
-    gssgd_beamforming_gain_threshold: float = 0.0,
-) -> Any:
-    """Run the RSMA/JRGEP scheduler on generated DAG tasks."""
+) -> SchedulerInputs:
+    """Build the shared task/network objects used by all schedulers."""
     rng = random.Random(random_seed)
     tasks = graphs_to_tasks(graphs, loss_threshold)
     feature_bits_by_name = build_feature_bits(num_iot_features, default_feature_bits, feature_bits_range, rng)
@@ -775,6 +835,7 @@ def run_rsma_scheduler(
         gpu_memory=server_gpu_memory,
         gpu_memory_range=server_gpu_memory_range,
         wired_rate_range=wired_rate_range,
+        wired_extra_link_probability=wired_extra_link_probability,
         rng=rng,
     )
     devices, topology = build_simple_devices(
@@ -790,68 +851,11 @@ def run_rsma_scheduler(
         rng=rng,
         max_power=max_device_power,
     )
-
-    scheduler = JRGEPScheduler(
+    return SchedulerInputs(
+        tasks=tasks,
+        feature_bits_by_name=feature_bits_by_name,
+        experts=experts,
         servers=servers,
         devices=devices,
-        experts=experts,
-        tasks=tasks,
-        config=FormulationConfig(
-            max_group_size=max_group_size,
-            min_rate=min_rate,
-            gssgd_beamforming_gain_threshold=gssgd_beamforming_gain_threshold,
-            c_bw=c_bw,
-            c_act=c_act,
-            c_fwd=c_fwd,
-            derive_bandwidth=True,
-            bandwidth_time_fraction=bandwidth_time_fraction,
-                noise_power=noise_power,
-            common_power_ratio=common_power_ratio,
-            default_power=max_device_power,
-            default_feature_bits=default_feature_bits,
-            feature_bits_by_name=feature_bits_by_name,
-            default_loss_threshold=loss_threshold if loss_threshold is not None else 3.0,
-            lambda_reconstruction=lambda_reconstruction,
-            calibration_alpha=calibration_alpha,
-        ),
+        topology=topology,
     )
-    result = scheduler.schedule()
-    network_context = {
-        "experts": experts,
-        "servers": servers,
-        "devices": devices,
-        "topology": topology,
-        "rsma_parameters": {
-            "num_servers": num_servers,
-            "num_iot_devices": num_iot_devices,
-            "features_per_device_range": features_per_device_range,
-            "expert_memory_range": expert_memory_range,
-            "experts_per_server": experts_per_server,
-            "server_gpu_memory_range": server_gpu_memory_range,
-            "wired_rate_range": wired_rate_range,
-            "bandwidth_mode": "derived",
-            "bandwidth_time_fraction": bandwidth_time_fraction,
-            "default_feature_bits": default_feature_bits,
-            "feature_bits_range": feature_bits_range,
-            "feature_bits_by_name": feature_bits_by_name,
-            "wavelength": wavelength,
-            "noise_power": noise_power,
-            "common_power_ratio": common_power_ratio,
-            "max_device_power": max_device_power,
-            "area_size": area_size,
-            "cell_radius": cell_radius,
-            "num_antennas": num_antennas,
-            "max_group_size": max_group_size,
-            "min_rate": min_rate,
-            "gssgd_beamforming_gain_threshold": gssgd_beamforming_gain_threshold,
-            "loss_threshold": loss_threshold,
-            "lambda_reconstruction": lambda_reconstruction,
-            "calibration_alpha": calibration_alpha,
-        },
-    }
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as file:
-        json.dump(result_to_jsonable(result, network_context), file, ensure_ascii=False, indent=2)
-
-    return result

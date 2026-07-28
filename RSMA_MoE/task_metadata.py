@@ -56,9 +56,39 @@ def make_gating_weights(
     return rounded
 
 
-def make_expert_confidence(num_experts: int, rng: random.Random) -> list[float]:
-    """Create pi(subtask|expert), the confidence of each expert for a node."""
-    return [round(rng.uniform(0.55, 0.98), 6) for _ in range(num_experts)]
+def make_expert_confidence(
+    num_experts: int,
+    rng: random.Random,
+    gating_weights: list[float] | None = None,
+) -> list[float]:
+    """Create pi(subtask|expert), the confidence of each expert for a node.
+
+    Experts preferred by the gating network should also tend to have higher
+    confidence for that subtask; otherwise removing one Top-K expert barely
+    changes P(selected experts | subtask).
+    """
+    if gating_weights is None:
+        return [round(rng.uniform(0.55, 0.98), 6) for _ in range(num_experts)]
+
+    if len(gating_weights) != num_experts:
+        raise ValueError("gating_weights length must match num_experts.")
+
+    ranked = sorted(range(num_experts), key=lambda index: gating_weights[index], reverse=True)
+    high_count = max(1, min(4, num_experts))
+    high_indices = set(ranked[:high_count])
+    medium_count = max(high_count, min(high_count * 2, num_experts))
+    medium_indices = set(ranked[high_count:medium_count])
+
+    confidences: list[float] = []
+    for index in range(num_experts):
+        if index in high_indices:
+            value = rng.uniform(0.85, 0.98)
+        elif index in medium_indices:
+            value = rng.uniform(0.45, 0.70)
+        else:
+            value = rng.uniform(0.10, 0.40)
+        confidences.append(round(value, 6))
+    return confidences
 
 
 def make_iot_features(
@@ -147,6 +177,12 @@ def make_node_attributes(
         error_range=reconstruction_error_range,
         rng=rng,
     )
+    gating_weights = make_gating_weights(
+        num_experts,
+        rng,
+        peak_count_range=gating_peak_count_range,
+        peak_mass_range=gating_peak_mass_range,
+    )
 
     return {
         "layer": layer,
@@ -156,13 +192,8 @@ def make_node_attributes(
             "upstream_outputs": [],
             "iot_features": iot_features,
         },
-        "gating_weights": make_gating_weights(
-            num_experts,
-            rng,
-            peak_count_range=gating_peak_count_range,
-            peak_mass_range=gating_peak_mass_range,
-        ),
-        "expert_confidence": make_expert_confidence(num_experts, rng),
+        "gating_weights": gating_weights,
+        "expert_confidence": make_expert_confidence(num_experts, rng, gating_weights),
         "reconstruction_errors": reconstruction_errors,
         "reconstruction_loss": compute_reconstruction_loss(
             reconstruction_errors,

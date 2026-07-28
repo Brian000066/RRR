@@ -1,4 +1,4 @@
-"""Hybrid algorithm: Top-K expert placement -> distance grouping -> backhaul repair."""
+"""Hybrid algorithm: Top-K expert placement -> location_aware grouping -> backhaul repair."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from rsma_integration import build_feature_bits, build_simple_devices, build_simple_experts, build_simple_servers, graphs_to_tasks  # noqa: E402
+from rsma_integration import build_scheduler_inputs  # noqa: E402
 from utils.formulation import (  # noqa: E402
     AssignmentKey,
     DeviceId,
@@ -83,6 +83,7 @@ class ChainedComparisonPipeline:
         clusters_per_server: Optional[int] = None,
         kmeans_iterations: int = 20,
         config: Optional[FormulationConfig] = None,
+        placement_random_seed: Optional[int] = None,
     ):
         if top_k < 1:
             raise ValueError("top_k must be at least 1.")
@@ -98,6 +99,7 @@ class ChainedComparisonPipeline:
         self.experts = normalize_experts(experts)
         self.tasks = normalize_tasks(tasks)
         self.evaluator = FormulationEvaluator(self.servers, self.devices, self.experts, self.tasks, self.config)
+        self.placement_rng = random.Random(0 if placement_random_seed is None else placement_random_seed)
         self.scheduler_violations: List[str] = []
 
     def run(self) -> ChainedPipelineResult:
@@ -286,8 +288,10 @@ class ChainedComparisonPipeline:
                     active_group_budgets,
                     subtask_features,
                     assignments,
+                    probability,
+                    threshold,
                 )
-                avg_rec = self._average_reconstruction_for_servers(subtask, key, target_servers, subtask_features)
+                avg_rec = self._average_reconstruction_for_servers(subtask, key, target_servers, subtask_features, assignments)
                 loss = self.evaluator.performance_loss_from_probability_and_reconstruction(probability, avg_rec)
 
                 while loss > threshold + 1e-12:
@@ -324,7 +328,7 @@ class ChainedComparisonPipeline:
                     self._server_feature_set(subtask_features, key, target_server).update(
                         group.required_features & subtask.required_features
                     )
-                    avg_rec = self._average_reconstruction_for_servers(subtask, key, target_servers, subtask_features)
+                    avg_rec = self._average_reconstruction_for_servers(subtask, key, target_servers, subtask_features, assignments)
                     loss = self.evaluator.performance_loss_from_probability_and_reconstruction(probability, avg_rec)
 
                 while self.allow_expert_loss_repair and loss > threshold + 1e-12:
@@ -350,8 +354,10 @@ class ChainedComparisonPipeline:
                         active_group_budgets,
                         subtask_features,
                         assignments,
+                        probability,
+                        threshold,
                     )
-                    avg_rec = self._average_reconstruction_for_servers(subtask, key, target_servers, subtask_features)
+                    avg_rec = self._average_reconstruction_for_servers(subtask, key, target_servers, subtask_features, assignments)
                     loss = self.evaluator.performance_loss_from_probability_and_reconstruction(probability, avg_rec)
 
                 if loss > threshold + 1e-12:
@@ -380,22 +386,98 @@ class ChainedComparisonPipeline:
         active_group_budgets: Dict[GroupKey, float],
         subtask_features: Dict[Tuple[str, str, str], Set[str]],
         assignments: Mapping[AssignmentKey, Sequence[Tuple[ServerId, ExpertId]]],
+        probability: float,
+        threshold: float,
     ) -> None:
         group_budget = self._subtask_bandwidth_budget(key, assignments)
         needed = set(subtask.required_features)
+        while True:
+            current_rec = self._average_reconstruction_for_servers(subtask, key, target_servers, subtask_features, assignments)
+            current_loss = self.evaluator.performance_loss_from_probability_and_reconstruction(probability, current_rec)
+            if current_loss <= threshold + 1e-12:
+                break
+            repair = self._best_local_group_loss_repair(
+                subtask,
+                key,
+                target_servers,
+                candidate_groups,
+                active_groups,
+                active_group_budgets,
+                subtask_features,
+                assignments,
+                probability,
+                threshold,
+            )
+            if repair is None:
+                break
+            group, target_server = repair
+            group_key = (group.server_id, group.id)
+            active_groups[group_key] = group
+            active_group_budgets[group_key] = min(active_group_budgets.get(group_key, group_budget), group_budget)
+            self._server_feature_set(subtask_features, key, target_server).update(
+                group.required_features & needed
+            )
+
+    def _best_local_group_loss_repair(
+        self,
+        subtask: SubtaskSpec,
+        key: AssignmentKey,
+        target_servers: Sequence[ServerId],
+        candidate_groups: Sequence[GroupSpec],
+        active_groups: Mapping[GroupKey, GroupSpec],
+        active_group_budgets: Mapping[GroupKey, float],
+        subtask_features: Mapping[Tuple[str, str, str], Set[str]],
+        assignments: Mapping[AssignmentKey, Sequence[Tuple[ServerId, ExpertId]]],
+        probability: float,
+        threshold: float,
+    ) -> Optional[Tuple[GroupSpec, ServerId]]:
+        needed = set(subtask.required_features)
+        satisfying = []
+        improving = []
+        current_rec = self._average_reconstruction_for_servers(subtask, key, target_servers, subtask_features, assignments)
+        current_loss = self.evaluator.performance_loss_from_probability_and_reconstruction(probability, current_rec)
         for target_server in target_servers:
-            local_groups = [
+            selected = set(subtask_features.get(self._server_feature_key(key, target_server), set()))
+            missing = needed - selected
+            if not missing:
+                continue
+            usable = [
                 group
                 for group in candidate_groups
-                if group.server_id == target_server and group.required_features & needed
+                if group.server_id == target_server and group.required_features & missing
             ]
-            for group in local_groups:
-                group_key = (group.server_id, group.id)
-                active_groups[group_key] = group
-                active_group_budgets[group_key] = min(active_group_budgets.get(group_key, group_budget), group_budget)
-                self._server_feature_set(subtask_features, key, target_server).update(
+            for group in usable:
+                trial_features = dict((k, set(v)) for k, v in subtask_features.items())
+                trial_features.setdefault(self._server_feature_key(key, target_server), set()).update(
                     group.required_features & needed
                 )
+                new_rec = self._average_reconstruction_for_servers(subtask, key, target_servers, trial_features, assignments)
+                new_loss = self.evaluator.performance_loss_from_probability_and_reconstruction(probability, new_rec)
+                if new_loss >= current_loss - 1e-12:
+                    continue
+                cost = self._group_incremental_cost(
+                    group,
+                    key,
+                    [target_server],
+                    active_groups,
+                    set(),
+                    active_group_budgets,
+                    assignments,
+                )
+                coverage = len(group.required_features & missing)
+                item = (cost, -coverage, group.server_id, group.id, target_server, group)
+                if new_loss <= threshold + 1e-12:
+                    satisfying.append(item)
+                else:
+                    improvement = current_loss - new_loss
+                    improving.append((-(improvement / max(cost, 1e-12)), cost, group.server_id, group.id, target_server, group))
+        if satisfying:
+            item = min(satisfying)
+            return item[-1], item[-2]
+        if improving:
+            item = min(improving)
+            return item[-1], item[-2]
+        return None
 
     def _average_reconstruction_for_servers(
         self,
@@ -403,14 +485,24 @@ class ChainedComparisonPipeline:
         key: AssignmentKey,
         target_servers: Sequence[ServerId],
         subtask_features: Mapping[Tuple[str, str, str], Set[str]],
+        assignments: Mapping[AssignmentKey, Sequence[Tuple[ServerId, ExpertId]]],
     ) -> float:
         if not target_servers:
             return subtask.reconstruction_loss
-        losses = []
+
+        weighted_loss = 0.0
+        total_experts = 0
         for server_id in target_servers:
+            expert_count = sum(1 for pair_server, _ in assignments.get(key, []) if pair_server == server_id)
+            if expert_count <= 0:
+                continue
             selected = set(subtask_features.get(self._server_feature_key(key, server_id), set()))
-            losses.append(self.evaluator.reconstruction_loss_for_features(subtask, selected))
-        return sum(losses) / len(losses)
+            server_loss = self.evaluator.reconstruction_loss_for_features(subtask, selected)
+            weighted_loss += expert_count * server_loss
+            total_experts += expert_count
+        if total_experts <= 0:
+            return subtask.reconstruction_loss
+        return weighted_loss / total_experts
 
     def _record_unavailable_missing_features(
         self,
@@ -463,7 +555,7 @@ class ChainedComparisonPipeline:
         needed = set(subtask.required_features)
         satisfying = []
         improving = []
-        current_rec = self._average_reconstruction_for_servers(subtask, key, target_servers, subtask_features)
+        current_rec = self._average_reconstruction_for_servers(subtask, key, target_servers, subtask_features, assignments)
         current_loss = self.evaluator.performance_loss_from_probability_and_reconstruction(probability, current_rec)
         for target_server in target_servers:
             selected = set(subtask_features.get(self._server_feature_key(key, target_server), set()))
@@ -480,7 +572,7 @@ class ChainedComparisonPipeline:
                 trial_features.setdefault(self._server_feature_key(key, target_server), set()).update(
                     group.required_features & needed
                 )
-                new_rec = self._average_reconstruction_for_servers(subtask, key, target_servers, trial_features)
+                new_rec = self._average_reconstruction_for_servers(subtask, key, target_servers, trial_features, assignments)
                 new_loss = self.evaluator.performance_loss_from_probability_and_reconstruction(probability, new_rec)
                 if new_loss >= current_loss - 1e-12:
                     continue
@@ -575,45 +667,45 @@ class ChainedComparisonPipeline:
             return 0.0
         return gating * subtask.expert_confidence[index]
 
-    def _best_server_for_expert(self, expert_id, activated, used_memory):
-        best = None
+    def _feasible_servers_for_expert(self, expert_id, activated, used_memory):
+        feasible = []
         expert = self.experts[expert_id]
         for server_id, server in self.servers.items():
             if expert_id not in server.stored_experts:
                 continue
             memory_after = used_memory.get(server_id, 0.0)
-            activation_penalty = 0.0
             if expert_id not in activated.get(server_id, set()):
                 memory_after += expert.memory
-                activation_penalty = self.config.c_act
-            if memory_after > server.gpu_memory:
-                continue
-            score = activation_penalty + expert.latency + (memory_after / max(server.gpu_memory, 1e-12))
-            if best is None or score < best[0]:
-                best = (score, server_id)
-        return None if best is None else best[1]
+            if memory_after <= server.gpu_memory:
+                feasible.append(server_id)
+        return sorted(feasible)
+
+    def _random_server_for_expert(self, expert_id, activated, used_memory):
+        feasible = self._feasible_servers_for_expert(expert_id, activated, used_memory)
+        if not feasible:
+            return None
+        return self.placement_rng.choice(feasible)
+
+    def _best_server_for_expert(self, expert_id, activated, used_memory):
+        return self._random_server_for_expert(expert_id, activated, used_memory)
 
     def _best_repair_candidate(self, subtask, selected_experts, activated, used_memory):
-        best = None
-        for server_id, server in self.servers.items():
-            for expert_id in server.stored_experts:
-                if expert_id in selected_experts:
-                    continue
-                contribution = self.evaluator.expert_contribution(subtask, expert_id)
-                if contribution <= 0.0:
-                    continue
-                expert = self.experts[expert_id]
-                memory_after = used_memory.get(server_id, 0.0)
-                activation_penalty = 0.0
-                if expert_id not in activated.get(server_id, set()):
-                    memory_after += expert.memory
-                    activation_penalty = self.config.c_act
-                if memory_after > server.gpu_memory:
-                    continue
-                score = -contribution + activation_penalty + expert.latency
-                if best is None or score < best[0]:
-                    best = (score, server_id, expert_id)
-        return None if best is None else (best[1], best[2])
+        candidates = []
+        for expert_id in sorted(self.experts):
+            if expert_id in selected_experts:
+                continue
+            contribution = self.evaluator.expert_contribution(subtask, expert_id)
+            if contribution <= 0.0:
+                continue
+            server_id = self._random_server_for_expert(expert_id, activated, used_memory)
+            if server_id is None:
+                continue
+            expert = self.experts[expert_id]
+            candidates.append((-contribution, expert.latency, expert_id, server_id))
+        if not candidates:
+            return None
+        _, _, expert_id, server_id = min(candidates)
+        return server_id, expert_id
 
     def _activate(self, server_id, expert_id, activated, used_memory):
         if expert_id in activated.setdefault(server_id, set()):
@@ -979,7 +1071,7 @@ def result_to_jsonable(
     evaluation = result.evaluation
     cost_units = cost_units or {}
     payload: Dict[str, Any] = {
-        "method": "hybrid_topk_distance_backhaul",
+        "method": "hybrid_topk_location_aware",
         "objective": {
             "total_cost": int(result.total_cost + 0.5),
             "activation_cost": int(result.activation_cost + 0.5),
@@ -1026,10 +1118,10 @@ def run_chained_pipeline(
     server_gpu_memory: float = 8192.0,
     server_gpu_memory_range: tuple[float, float] | None = None,
     wired_rate_range: tuple[float, float] | None = None,
+    wired_extra_link_probability: float = 0.05,
     c_bw: float = 1e-3,
     c_act: float = 1.0,
     c_fwd: float = 1.0,
-    bandwidth_time_fraction: float = 1.0,
     default_feature_bits: float = 12000.0,
     wavelength: float = 0.125,
     noise_power: float = 1e-18,
@@ -1050,32 +1142,36 @@ def run_chained_pipeline(
     clusters_per_server: Optional[int] = None,
     kmeans_iterations: int = 20,
 ) -> ChainedPipelineResult:
-    rng = random.Random(random_seed)
-    tasks = graphs_to_tasks(graphs, loss_threshold)
-    feature_bits_by_name = build_feature_bits(num_iot_features, default_feature_bits, feature_bits_range, rng)
-    experts = build_simple_experts(num_experts, memory_range=expert_memory_range, rng=rng)
-    servers = build_simple_servers(
-        num_servers=num_servers,
-        experts=experts,
-        experts_per_server=experts_per_server,
-        gpu_memory=server_gpu_memory,
-        gpu_memory_range=server_gpu_memory_range,
-        wired_rate_range=wired_rate_range,
-        rng=rng,
-    )
-    devices, topology = build_simple_devices(
+    inputs = build_scheduler_inputs(
+        graphs=graphs,
+        num_experts=num_experts,
         num_iot_features=num_iot_features,
-        num_iot_devices=num_iot_devices,
+        expert_memory_range=expert_memory_range,
+        feature_bits_range=feature_bits_range,
         num_servers=num_servers,
+        num_iot_devices=num_iot_devices,
         features_per_device_range=features_per_device_range,
         server_feature_overlap_ratio=server_feature_overlap_ratio,
         global_random_feature_fraction=global_random_feature_fraction,
+        experts_per_server=experts_per_server,
+        server_gpu_memory=server_gpu_memory,
+        server_gpu_memory_range=server_gpu_memory_range,
+        wired_rate_range=wired_rate_range,
+        wired_extra_link_probability=wired_extra_link_probability,
+        default_feature_bits=default_feature_bits,
+        max_device_power=max_device_power,
         area_size=area_size,
         cell_radius=cell_radius,
         num_antennas=num_antennas,
-        rng=rng,
-        max_power=max_device_power,
+        loss_threshold=loss_threshold,
+        random_seed=random_seed,
     )
+    tasks = inputs.tasks
+    feature_bits_by_name = inputs.feature_bits_by_name
+    experts = inputs.experts
+    servers = inputs.servers
+    devices = inputs.devices
+    topology = inputs.topology
     pipeline = ChainedComparisonPipeline(
         servers=servers,
         devices=devices,
@@ -1085,6 +1181,7 @@ def run_chained_pipeline(
         rank_by=rank_by,
         clusters_per_server=clusters_per_server,
         kmeans_iterations=kmeans_iterations,
+        placement_random_seed=random_seed,
         config=FormulationConfig(
             max_group_size=max_group_size,
             min_rate=min_rate,
@@ -1093,7 +1190,6 @@ def run_chained_pipeline(
             c_act=c_act,
             c_fwd=c_fwd,
             derive_bandwidth=True,
-            bandwidth_time_fraction=bandwidth_time_fraction,
             noise_power=noise_power,
             common_power_ratio=common_power_ratio,
             default_power=max_device_power,
@@ -1133,8 +1229,8 @@ def run_chained_pipeline(
             "experts_per_server": experts_per_server,
             "server_gpu_memory_range": server_gpu_memory_range,
             "wired_rate_range": wired_rate_range,
+            "wired_extra_link_probability": wired_extra_link_probability,
             "bandwidth_mode": "derived_by_group_slack",
-            "bandwidth_time_fraction": bandwidth_time_fraction,
             "default_feature_bits": default_feature_bits,
             "feature_bits_range": feature_bits_range,
             "feature_bits_by_name": feature_bits_by_name,
@@ -1147,7 +1243,7 @@ def run_chained_pipeline(
             "num_antennas": num_antennas,
             "max_group_size": max_group_size,
             "min_rate": min_rate,
-            "distance_group_selection_mode": "loss_repair_until_bound",
+            "location_aware_group_selection_mode": "loss_repair_until_bound",
             "loss_threshold": loss_threshold,
             "lambda_reconstruction": lambda_reconstruction,
             "calibration_alpha": calibration_alpha,
@@ -1167,6 +1263,15 @@ def run_chained_pipeline(
             indent=2,
         )
     return result
+
+
+
+
+
+
+
+
+
 
 
 
