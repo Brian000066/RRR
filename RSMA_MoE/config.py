@@ -14,7 +14,7 @@ BASE_DIR = Path(__file__).resolve().parent
 class ExperimentConfig:
     # Reproducibility / output.
     auto_random_seed: bool = True
-    num_runs: int = 10
+    num_runs: int = 100
     num_dags: int = 5
     random_seed: int = 42
     network_random_seed: int = 1
@@ -93,8 +93,10 @@ class ExperimentConfig:
     iot_features_per_device_range: tuple[int, int] = (3, 12)
     iot_server_feature_overlap_ratio: float = 0.20
     iot_global_random_feature_fraction: float = 0.2
-    experts_per_server: int = 5
-    server_gpu_memory_range: tuple[float, float] = (640.0, 896.0)
+    #experts_per_server: int = 5
+    experts_per_server: int = 8
+    #server_gpu_memory_range: tuple[float, float] = (640.0, 896.0)
+    server_gpu_memory_range: tuple[float, float] = (1280.0, 1792.0)
     wired_rate_range: tuple[float, float] = (5e8, 1.5e9)
     wired_extra_link_probability: float = 0.05
     wavelength: float = 0.125
