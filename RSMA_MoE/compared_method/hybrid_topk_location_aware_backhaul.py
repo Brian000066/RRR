@@ -218,7 +218,8 @@ class ChainedComparisonPipeline:
             return False
         pairs.append((server_id, expert_id))
         return True
-
+    
+    #這部份負責expert selection，因此對這個部份來修改
     def _assign_topk_experts(self):
         assignments: Dict[AssignmentKey, List[Tuple[ServerId, ExpertId]]] = {}
         selected_probability: Dict[str, float] = {}
@@ -232,18 +233,14 @@ class ChainedComparisonPipeline:
             for subtask in task.subtasks:
                 key = (task.id, subtask.id)
                 label = self._assignment_label(key)
+                server_id, expert_ids = self._best_server_for_subtask(subtask, activated, used_memory)
                 selected: List[Tuple[ServerId, ExpertId]] = []
                 selected_experts: Set[ExpertId] = set()
-                for expert_id in self._ranked_experts(subtask):
-                    if len(selected) >= self.top_k:
-                        break
-                    server_id = self._best_server_for_expert(expert_id, activated, used_memory)
-                    if server_id is None:
-                        continue
-                    if not self._append_unique_assignment(selected, server_id, expert_id):
-                        continue
-                    selected_experts.add(expert_id)
-                    self._activate(server_id, expert_id, activated, used_memory)
+                if server_id is not None:
+                    for expert_id in expert_ids:
+                        selected.append((server_id, expert_id))
+                        selected_experts.add(expert_id)
+                        self._activate(server_id, expert_id, activated, used_memory)
                 if len(selected) < min(self.top_k, len(self.experts)):
                     self.scheduler_violations.append(
                         f"TopK placement: only {len(selected)} feasible experts for {key}; target {self.top_k}"
@@ -252,6 +249,77 @@ class ChainedComparisonPipeline:
                 selected_experts_by_key[key] = selected_experts
                 selected_probability[label] = self.evaluator.selection_probability(subtask, selected_experts)
         return assignments, selected_probability, selected_experts_by_key, activated, used_memory
+        
+    #此為額外新增的function，用在「_assign_topk_experts」function內
+    def _best_server_for_subtask(
+        self,
+        subtask,
+        activated,
+        used_memory,
+    ):
+        candidates = []
+
+        for server_id, server in self.servers.items():
+
+            feasible_experts = []
+            extra_memory = 0.0
+
+            for expert_id in self._ranked_experts(subtask):
+
+                # 這台 server 必須有存這個 expert
+                if expert_id not in server.stored_experts:
+                    continue
+
+                memory_add = 0.0
+
+                if expert_id not in activated.get(server_id, set()):
+                    memory_add = self.experts[expert_id].memory
+
+                # 檢查這個 node 的多個 experts 加起來是否超過 GPU memory
+                if (
+                    used_memory.get(server_id, 0.0)
+                    + extra_memory
+                    + memory_add
+                    > server.gpu_memory
+                ):
+                    continue
+
+                feasible_experts.append(expert_id)
+                extra_memory += memory_add
+
+                if len(feasible_experts) >= self.top_k:
+                    break
+
+            if not feasible_experts:
+                continue
+
+            score = sum(
+                self._expert_score(subtask, expert_id)
+                for expert_id in feasible_experts
+            )
+
+            candidates.append(
+                (
+                    len(feasible_experts),
+                    score,
+                    server_id,
+                    feasible_experts,
+                )
+            )
+
+        if not candidates:
+            return None, []
+
+        # 優先：
+        # 1. 能提供較多 experts 的 server
+        # 2. expert suitability / gating score 較高
+        candidates.sort(
+            key=lambda x: (-x[0], -x[1], str(x[2]))
+        )
+
+        _, _, server_id, expert_ids = candidates[0]
+
+        return server_id, expert_ids
 
     def _repair_loss_with_groups(
         self,
@@ -686,6 +754,7 @@ class ChainedComparisonPipeline:
             return None
         return self.placement_rng.choice(feasible)
 
+    #不使用
     def _best_server_for_expert(self, expert_id, activated, used_memory):
         return self._random_server_for_expert(expert_id, activated, used_memory)
 

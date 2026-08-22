@@ -191,6 +191,7 @@ class WDMoEExpertSelectionMixin:
             return 0.0
         return sum(values) / len(values)
 
+    #這部份負責expert selection，因此對這個部份來修改
     def _wdmoe_assign_subtask(
         self,
         task,
@@ -202,128 +203,180 @@ class WDMoEExpertSelectionMixin:
         theta: Optional[float],
         allow_pruning: bool,
     ):
-        key = (task.id, subtask.id)
-        latency_vector = self._wdmoe_latency_vector(
-            task=task,
-            subtask=subtask,
-            committed_assignments=committed_assignments,
-            task_assignments=task_assignments,
-            activated=activated,
-            used_memory=used_memory,
-        )
-        baseline_experts = set(self._top_k_experts(subtask)[: self.top_k])
-        if not baseline_experts:
-            baseline_experts = set(self._fallback_top_experts(subtask, count=self.top_k))
+        best_candidate = None
 
-        baseline_wlr = self._wdmoe_subtask_wlr(subtask, baseline_experts, latency_vector)
-        similarity = self._wdmoe_weight_latency_similarity(subtask, latency_vector)
-        candidate_experts = set(baseline_experts)
-        attempted_pruning = False
-
-        if allow_pruning and theta is not None and len(candidate_experts) > 1 and similarity <= theta:
-            dropped = min(
-                candidate_experts,
-                key=lambda expert_id: (self._expert_score(subtask, expert_id), expert_id),
+        for server_id in sorted(self.servers):
+            # 1. Only consider experts stored on this server
+            baseline_experts = self._wdmoe_candidate_experts_on_server(
+                subtask=subtask,
+                server_id=server_id,
+                activated=activated,
+                used_memory=used_memory,
             )
-            candidate_experts.remove(dropped)
-            attempted_pruning = True
+            # This server cannot provide enough experts
+            if len(baseline_experts) < self.top_k:
+                continue
 
-        selected_wlr = self._wdmoe_subtask_wlr(subtask, candidate_experts, latency_vector)
+            # 2. Calculate latency assuming the entire node
+            #    is executed on this server
+            latency_vector = self._wdmoe_latency_vector_on_server(
+                task=task,
+                subtask=subtask,
+                server_id=server_id,
+                expert_ids=baseline_experts,
+                committed_assignments=committed_assignments,
+                task_assignments=task_assignments,
+            )
+            baseline_wlr = self._wdmoe_subtask_wlr(subtask, baseline_experts, latency_vector)
+            similarity = self._wdmoe_weight_latency_similarity(subtask, latency_vector)
+            candidate_experts = set(baseline_experts)
 
-        if attempted_pruning:
-            candidate_probability = self.evaluator.selection_probability(subtask, candidate_experts)
-            full_features = set(subtask.required_features)
-            candidate_loss = self.evaluator.performance_loss_from_probability(
+            # 3. WDMoE pruning
+            attempted_pruning = False
+            if allow_pruning and theta is not None and len(candidate_experts) > 1 and similarity <= theta:
+                dropped = min(
+                    candidate_experts,
+                    key=lambda expert_id: (self._expert_score(subtask, expert_id), expert_id),
+                )
+                candidate_experts.remove(dropped)
+                attempted_pruning = True
+
+            # 4. Check performance-loss constraint
+            if attempted_pruning:
+                probability = self.evaluator.selection_probability(subtask, candidate_experts)
+                full_features = set(subtask.required_features)
+                loss = self.evaluator.performance_loss_from_probability(
+                    subtask,
+                    probability,
+                    full_features,
+                )
+                loss_bound = self.evaluator.conformal_loss_threshold(subtask)
+                if loss > loss_bound + 1e-12:
+                    candidate_experts = set(baseline_experts)
+                    attempted_pruning = False
+
+            # 5. Evaluate this server
+            selected_wlr = self._wdmoe_subtask_wlr(
                 subtask,
-                candidate_probability,
-                full_features,
+                candidate_experts,
+                latency_vector,
             )
-            loss_bound = self.evaluator.conformal_loss_threshold(subtask)
-            if candidate_loss > loss_bound + 1e-12:
-                candidate_experts = set(baseline_experts)
-                selected_wlr = baseline_wlr
-                attempted_pruning = False
+            candidate = {
+                "server_id": server_id,
+                "experts": candidate_experts,
+                "baseline_experts": baseline_experts,
+                "baseline_wlr": baseline_wlr,
+                "selected_wlr": selected_wlr,
+                "similarity": similarity,
+                "attempted_pruning": attempted_pruning,
+            }
+            # WDMoE: select candidate with highest WLR
+            if best_candidate is None or candidate["selected_wlr"] > best_candidate["selected_wlr"]:
+                best_candidate = candidate
+
+        if best_candidate is None:
+            raise RuntimeError(
+                f"No feasible server for subtask "
+                f"{task.id}-{subtask.id}"
+            )
+
+        # 6. Commit ONLY ONE server
+        server_id = best_candidate["server_id"]
+        selected_experts = best_candidate["experts"]
 
         pairs: list[tuple[ServerId, ExpertId]] = []
-        feasible_experts: Set[ExpertId] = set()
-        target_count = len(candidate_experts)
-        ordered_experts = sorted(candidate_experts, key=lambda eid: (-self._expert_score(subtask, eid), eid))
-        for expert_id in ordered_experts:
-            server_id = self._best_server_for_expert_with_predecessors(
-                expert_id=expert_id,
-                task=task,
-                subtask=subtask,
-                committed_assignments=committed_assignments,
-                task_assignments=task_assignments,
-                activated=activated,
-                used_memory=used_memory,
-            )
-            if server_id is None:
-                continue
-            if not self._append_unique_assignment(pairs, server_id, expert_id):
-                continue
-            feasible_experts.add(expert_id)
+        for expert_id in sorted(selected_experts):
+            pairs.append((server_id, expert_id))
             self._activate(server_id, expert_id, activated, used_memory)
 
-        while len(pairs) < target_count:
-            fallback = self._best_wdmoe_loss_repair_candidate(
-                task=task,
-                subtask=subtask,
-                selected_experts=feasible_experts,
-                committed_assignments=committed_assignments,
-                task_assignments=task_assignments,
-                activated=activated,
-                used_memory=used_memory,
-            )
-            if fallback is None:
-                break
-            server_id, expert_id = fallback
-            if not self._append_unique_assignment(pairs, server_id, expert_id):
-                break
-            feasible_experts.add(expert_id)
-            self._activate(server_id, expert_id, activated, used_memory)
-
-        if attempted_pruning and len(feasible_experts) < self.top_k:
-            full_features = set(subtask.required_features)
-            loss_bound = self.evaluator.conformal_loss_threshold(subtask)
-            probability = self.evaluator.selection_probability(subtask, feasible_experts)
-            loss = self.evaluator.performance_loss_from_probability(subtask, probability, full_features)
-            while loss > loss_bound + 1e-12 and len(feasible_experts) < self.top_k:
-                fallback = self._best_wdmoe_loss_repair_candidate(
-                    task=task,
-                    subtask=subtask,
-                    selected_experts=feasible_experts,
-                    committed_assignments=committed_assignments,
-                    task_assignments=task_assignments,
-                    activated=activated,
-                    used_memory=used_memory,
-                )
-                if fallback is None:
-                    break
-                server_id, expert_id = fallback
-                if not self._append_unique_assignment(pairs, server_id, expert_id):
-                    break
-                feasible_experts.add(expert_id)
-                self._activate(server_id, expert_id, activated, used_memory)
-                probability = self.evaluator.selection_probability(subtask, feasible_experts)
-                loss = self.evaluator.performance_loss_from_probability(subtask, probability, full_features)
-            if len(feasible_experts) > len(candidate_experts):
-                candidate_experts = set(feasible_experts)
-                selected_wlr = self._wdmoe_subtask_wlr(subtask, candidate_experts, latency_vector)
-
-        actual_wlr = self._wdmoe_subtask_wlr(subtask, feasible_experts, latency_vector)
         metrics = {
-            "baseline_wlr": baseline_wlr,
-            "selected_wlr": actual_wlr,
-            "wlr_ratio": actual_wlr / max(baseline_wlr, 1e-12),
-            "similarity": similarity,
+            "baseline_wlr": best_candidate["baseline_wlr"],
+            "selected_wlr": best_candidate["selected_wlr"],
+            "wlr_ratio": (best_candidate["selected_wlr"] / max(best_candidate["baseline_wlr"], 1e-12)),
+            "similarity": best_candidate["similarity"],
             "theta": theta if theta is not None else 0.0,
-            "attempted_pruning": attempted_pruning,
-            "pruned": len(feasible_experts) < len(baseline_experts),
-            "baseline_expert_count": len(baseline_experts),
-            "selected_expert_count": len(feasible_experts),
+            "attempted_pruning": best_candidate["attempted_pruning"],
+            "pruned": (len(selected_experts) < len(best_candidate["baseline_experts"])),
+            "baseline_expert_count": len(best_candidate["baseline_experts"]),
+            "selected_expert_count": len(selected_experts),
+            "selected_server": server_id,
         }
-        return pairs, feasible_experts, metrics
+
+        return pairs, selected_experts, metrics
+
+    #此為額外新增的function，用在「_wdmoe_assign_subtask」function內
+    def _wdmoe_candidate_experts_on_server(
+        self,
+        subtask,
+        server_id,
+        activated,
+        used_memory,
+    ):
+        server = self.servers[server_id]
+
+        ranked_experts = sorted(
+            [
+                expert_id
+                for expert_id in server.stored_experts
+                if expert_id in self.experts
+            ],
+            key=lambda eid: (
+                -self._expert_score(subtask, eid),
+                eid,
+            ),
+        )
+
+        selected = []
+        memory = used_memory.get(server_id, 0.0)
+
+        for expert_id in ranked_experts:
+            extra_memory = 0.0
+
+            if expert_id not in activated.get(server_id, set()):
+                extra_memory = self.experts[expert_id].memory
+
+            if memory + extra_memory > server.gpu_memory:
+                continue
+
+            selected.append(expert_id)
+            memory += extra_memory
+
+            if len(selected) >= self.top_k:
+                break
+
+        return set(selected)
+
+    #此為額外新增的function，用在「_wdmoe_assign_subtask」function內
+    #與「_wdmoe_latency_vector」function差別在於「server_id」變數是直接做為input，而不是在這個function內產生
+    def _wdmoe_latency_vector_on_server(
+        self,
+        task,
+        subtask,
+        server_id,
+        expert_ids,
+        committed_assignments,
+        task_assignments,
+    ):
+        merged = dict(committed_assignments)
+        merged.update(task_assignments)
+
+        forwarding_time = self._wdmoe_predecessor_forwarding_time(
+            task,
+            subtask,
+            server_id,
+            merged,
+            {},
+        )
+
+        latencies = {}
+
+        for expert_id in expert_ids:
+            latencies[expert_id] = (
+                forwarding_time
+                + self.experts[expert_id].latency
+            )
+
+        return latencies
 
     def _wdmoe_subtask_wlr(self, subtask, selected_experts: Set[ExpertId], latency_vector: Mapping[ExpertId, float]) -> float:
         values = [
@@ -333,6 +386,8 @@ class WDMoEExpertSelectionMixin:
         if not values:
             return 0.0
         return sum(values) / len(values)
+        
+    #不使用
     def _wdmoe_latency_vector(
         self,
         task,
@@ -357,12 +412,14 @@ class WDMoEExpertSelectionMixin:
             )
         return latencies
 
-    def _wdmoe_weight_latency_similarity(self, subtask, latency_vector) -> float:
+    #此處也進行修改
+    def _wdmoe_weight_latency_similarity(self, subtask, latency_vector):
         weights = []
         latencies = []
-        for expert_id in self.experts:
+        for expert_id in latency_vector:
             weights.append(self._expert_weight(subtask, expert_id))
-            latencies.append(latency_vector.get(expert_id, 1e6))
+            #latencies.append(latency_vector.get(expert_id, 1e6))
+            latencies.append(latency_vector[expert_id])
         weight_norm = math.sqrt(sum(value * value for value in weights))
         latency_norm = math.sqrt(sum(value * value for value in latencies))
         if weight_norm <= 0.0 or latency_norm <= 0.0:
@@ -383,6 +440,7 @@ class WDMoEExpertSelectionMixin:
                 feasible.append(server_id)
         return feasible
 
+    #不使用
     def _best_server_for_expert_with_predecessors(
         self,
         expert_id,
@@ -398,6 +456,7 @@ class WDMoEExpertSelectionMixin:
             return None
         return self.placement_rng.choice(feasible_servers)
 
+    #不使用
     def _best_wdmoe_loss_repair_candidate(
         self,
         task,
