@@ -318,7 +318,7 @@ def run_similarity_aware_topk_backhaul(
             "server_gpu_memory_range": server_gpu_memory_range,
             "wired_rate_range": wired_rate_range,
             "wired_extra_link_probability": wired_extra_link_probability,
-            "bandwidth_mode": "derived_by_group_slack",
+            "bandwidth_mode": "pdf_equivalent_bandwidth_demand_by_group_slack",
             "feature_bits_range": feature_bits_range,
             "wavelength": wavelength,
             "noise_power": noise_power,
@@ -333,7 +333,7 @@ def run_similarity_aware_topk_backhaul(
     payload = hybrid_result_to_jsonable(
         result,
         network_context,
-        cost_units={"activation": c_act, "bandwidth": c_bw, "forwarding": c_fwd},
+        cost_units={"activation": c_act, "bandwidth": c_bw, "forwarding": c_fwd, "inference": 1.0},
     )
     payload["method"] = "jrgep"
     payload["algorithm_reports"] = {
@@ -346,8 +346,6 @@ def run_similarity_aware_topk_backhaul(
     with output_path.open("w", encoding="utf-8") as file:
         json.dump(payload, file, ensure_ascii=False, indent=2)
     return result
-
-
 
 
 

@@ -172,6 +172,7 @@ class Phase3RefinementPruningMixin:
             activation_cost=evaluation.objective.activation_cost,
             bandwidth_cost=evaluation.objective.bandwidth_cost,
             forwarding_cost=evaluation.objective.forwarding_cost,
+            inference_cost=evaluation.objective.inference_cost,
             backhaul=backhaul,
             violations=list(evaluation.violations),
             evaluation=evaluation,
@@ -541,7 +542,6 @@ class Phase3RefinementPruningMixin:
                     avg_rec,
                 )
         return list(groups), subtask_features, required_probability, reconstruction_loss, performance_loss
-
 
 
 

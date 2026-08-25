@@ -37,7 +37,7 @@ class Phase1ServerExpertSelectionMixin:
         top_k_limit = max(1, min(int(self.top_k), len(self.experts)))
 
         for key, subtask in selection_units:
-            selected = self._select_bounded_expert_server_set(
+            selected = self._select_single_server_expert_set(
                 key=key,
                 subtask=subtask,
                 assignments=assignments,
@@ -72,11 +72,87 @@ class Phase1ServerExpertSelectionMixin:
                 "top_k_limit": top_k_limit,
                 "unsatisfied_after_phase1": unsatisfied_after_phase1,
                 "average_pairs_per_node": total_pairs / len(selection_units) if selection_units else 0.0,
-                "mode": "bounded_combination_global_expert_server_selection",
-                "note": "r_sim is used for gating smoothing; Phase 1 selects a bounded server-expert set per node.",
+                "mode": "single_server_expert_set_selection",
+                "note": "r_sim is used for gating smoothing; Phase 1 assigns each node to one MEC server and selects all experts on that server.",
             }
         )
         return assignments, selected_probability, selected_experts_by_key, activated, used_memory
+
+    def _select_single_server_expert_set(
+        self,
+        *,
+        key: AssignmentKey,
+        subtask: SubtaskSpec,
+        assignments: Mapping[AssignmentKey, Sequence[tuple[ServerId, ExpertId]]],
+        activated: Mapping[ServerId, Set[ExpertId]],
+        used_memory: Mapping[ServerId, float],
+        top_k_limit: int,
+    ) -> list[tuple[ServerId, ExpertId]]:
+        threshold = self.evaluator.conformal_loss_threshold(subtask)
+        best_feasible = None
+        best_fallback = None
+
+        for server_id in sorted(self.servers):
+            candidate_experts = self._single_server_candidate_experts(
+                server_id,
+                subtask,
+                activated,
+                used_memory,
+                top_k_limit,
+            )
+            if not candidate_experts:
+                continue
+            for size in range(1, len(candidate_experts) + 1):
+                for combo in combinations(candidate_experts, size):
+                    pairs = tuple((server_id, expert_id) for expert_id in combo)
+                    if not self._pair_set_memory_feasible(pairs, activated, used_memory):
+                        continue
+                    experts = set(combo)
+                    probability = self.evaluator.selection_probability(subtask, experts)
+                    rec_loss = self._estimated_local_reconstruction_for_pairs(subtask, pairs)
+                    loss = self.evaluator.performance_loss_from_probability_and_reconstruction(probability, rec_loss)
+                    cost = self._pair_set_incremental_cost(key, subtask, pairs, assignments, activated, used_memory)
+                    item = (cost, len(pairs), rec_loss, -probability, server_id, pairs)
+                    if loss <= threshold + 1e-12:
+                        if best_feasible is None or item[:5] < best_feasible[:5]:
+                            best_feasible = item
+                    fallback_item = (loss, cost, len(pairs), rec_loss, -probability, server_id, pairs)
+                    if best_fallback is None or fallback_item[:6] < best_fallback[:6]:
+                        best_fallback = fallback_item
+
+        if best_feasible is not None:
+            return list(best_feasible[-1])
+        if best_fallback is not None:
+            return list(best_fallback[-1])
+        return []
+
+    def _single_server_candidate_experts(
+        self,
+        server_id: ServerId,
+        subtask: SubtaskSpec,
+        activated: Mapping[ServerId, Set[ExpertId]],
+        used_memory: Mapping[ServerId, float],
+        top_k_limit: int,
+    ) -> list[ExpertId]:
+        server = self.servers[server_id]
+        ranked = [
+            expert_id
+            for expert_id in self._cluster_ranked_experts([((server_id, subtask.id), subtask)])
+            if expert_id in server.stored_experts
+        ]
+        candidates: list[ExpertId] = []
+        memory = used_memory.get(server_id, 0.0)
+        for expert_id in ranked:
+            extra_memory = 0.0
+            if expert_id not in activated.get(server_id, set()):
+                extra_memory = self.experts[expert_id].memory
+            if memory + extra_memory > server.gpu_memory + 1e-12:
+                continue
+            candidates.append(expert_id)
+            memory += extra_memory
+            if len(candidates) >= top_k_limit:
+                break
+        return candidates
 
     def _select_bounded_expert_server_set(
         self,
@@ -198,7 +274,7 @@ class Phase1ServerExpertSelectionMixin:
                 continue
             seen_activation.add(pair)
             if expert_id not in activated.get(server_id, set()):
-                activation_cost += self.config.c_act
+                activation_cost += self.config.c_act * self.experts[expert_id].memory
 
         forwarding_cost = 0.0
         for server_id, _ in pairs:
@@ -387,7 +463,7 @@ class Phase1ServerExpertSelectionMixin:
         activation_cost = 0.0
         if expert_id not in activated.get(server_id, set()):
             memory_after += expert.memory
-            activation_cost = self.config.c_act
+            activation_cost = self.config.c_act * expert.memory
         if memory_after > server.gpu_memory:
             return float("inf")
 
@@ -453,7 +529,8 @@ class Phase1ServerExpertSelectionMixin:
         local_devices = [
             device_id
             for device_id, device in self.devices.items()
-            if device.home_server == server_id and device.features & required
+            if self._device_can_transmit_to_server(device_id, server_id)
+            and device.features & required
         ]
         while remaining and local_devices:
             best = None
@@ -510,8 +587,9 @@ class Phase1ServerExpertSelectionMixin:
                 if source_server == server_id:
                     continue
                 has_feature = any(
-                    device.home_server == source_server and feature in device.features
-                    for device in self.devices.values()
+                    self._device_can_transmit_to_server(device_id, source_server)
+                    and feature in device.features
+                    for device_id, device in self.devices.items()
                 )
                 if not has_feature:
                     continue
@@ -540,11 +618,7 @@ class Phase1ServerExpertSelectionMixin:
         weighted_loss = 0.0
         total_experts = 0
         for server_id, _ in selected_pairs:
-            local_devices = [
-                device_id
-                for device_id, device in self.devices.items()
-                if device.home_server == server_id
-            ]
+            local_devices = self._server_transmittable_devices(server_id)
             local_features = self._server_local_features(local_devices) & required
             weighted_loss += self.evaluator.reconstruction_loss_for_features(subtask, local_features)
             total_experts += 1
@@ -661,8 +735,4 @@ class Phase1ServerExpertSelectionMixin:
         if source_server == target_server:
             return 0.0
         return self.config.c_fwd * self.evaluator.wired_weight(source_server, target_server)
-
-
-
-
 

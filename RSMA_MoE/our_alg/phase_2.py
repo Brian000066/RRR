@@ -99,6 +99,7 @@ class Phase2GroupingBackhaulMixin:
             activation_cost=evaluation.objective.activation_cost,
             bandwidth_cost=evaluation.objective.bandwidth_cost,
             forwarding_cost=evaluation.objective.forwarding_cost,
+            inference_cost=evaluation.objective.inference_cost,
             backhaul=backhaul,
             violations=violations,
             evaluation=evaluation,
@@ -281,6 +282,8 @@ class Phase2GroupingBackhaulMixin:
             if not missing:
                 continue
             for group in candidate_groups:
+                if not self._group_available_with_active_devices(group, active_groups):
+                    continue
                 is_local = group.server_id == target_server
                 if local_only != is_local:
                     continue
@@ -418,7 +421,14 @@ class Phase2GroupingBackhaulMixin:
                     if not self.allow_expert_loss_repair:
                         break
                     selected_experts = selected_experts_by_key.setdefault(key, set())
-                    candidate = self._best_repair_candidate(subtask, selected_experts, activated, used_memory)
+                    assigned_server = target_servers[0] if len(target_servers) == 1 else None
+                    candidate = self._best_repair_candidate(
+                        subtask,
+                        selected_experts,
+                        activated,
+                        used_memory,
+                        assigned_server=assigned_server,
+                    )
                     if candidate is None:
                         break
                     server_id, expert_id = candidate
@@ -498,6 +508,8 @@ class Phase2GroupingBackhaulMixin:
 
         group_options = []
         for group in candidate_groups:
+            if not self._group_available_with_active_devices(group, active_groups):
+                continue
             additions = []
             for server_index, target_server in enumerate(ordered_servers):
                 missing_mask = full_mask & ~initial_state[server_index]
@@ -658,6 +670,8 @@ class Phase2GroupingBackhaulMixin:
         needed = set(subtask.required_features)
         for group, target_server in plan:
             group_key = (group.server_id, group.id)
+            if not self._group_available_with_active_devices(group, active_groups):
+                continue
             active_groups[group_key] = group
             active_group_budgets[group_key] = min(
                 active_group_budgets.get(group_key, group_budget),
@@ -678,8 +692,7 @@ class Phase2GroupingBackhaulMixin:
         for server_id in self.servers:
             local_devices = [
                 device_id
-                for device_id, device in self.devices.items()
-                if device.home_server == server_id
+                for device_id in self._server_transmittable_devices(server_id)
             ]
             local_required = globally_required & self._server_local_features(local_devices)
             if not local_required:
@@ -830,5 +843,3 @@ class Phase2GroupingBackhaulMixin:
             return (served_volume * effective_rate_score) / max(bandwidth_demand, 1e-12)
         except Exception:
             return -self.evaluator.group_feature_volume(group)
-
-
