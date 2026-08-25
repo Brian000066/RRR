@@ -99,9 +99,15 @@ def node_to_subtask(
     iot_features = required_data.get("iot_features", [])
     gating_weights = list(node.get("gating_weights", []))
     expert_confidence = list(node.get("expert_confidence", []))
+    reconstruction_errors = list(node.get("reconstruction_errors", []))
+    reconstruction_errors_by_feature = {
+        feature_name(feature): float(error)
+        for feature, error in zip(iot_features, reconstruction_errors)
+    }
 
     return {
         "id": str(node_id),
+        "unique_id": str(node.get("unique_subtask_id", node_id)),
         "required_features": [feature_name(index) for index in iot_features],
         "predecessors": [str(item) for item in predecessors],
         "output_tokens": 256,
@@ -111,6 +117,7 @@ def node_to_subtask(
         "gating_weights": gating_weights,
         "expert_confidence": expert_confidence,
         "reconstruction_loss": float(node.get("reconstruction_loss", 0.0)),
+        "reconstruction_errors_by_feature": reconstruction_errors_by_feature,
         "calibration_losses": list(node.get("calibration_losses", [])),
     }
 
@@ -245,6 +252,7 @@ def build_simple_experts(
             "index": index,
             "memory": memory,
             "latency": 0.05 + index * 0.01,
+            "inference_cost": memory * 0.01,
         }
     return experts
 

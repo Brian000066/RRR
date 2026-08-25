@@ -612,6 +612,40 @@ def save_dag_json(graph: nx.DiGraph, output_path: Path) -> None:
     )
 
 
+def apply_unique_subtask_templates(
+    graph: nx.DiGraph,
+    templates: dict[str, dict[str, object]],
+) -> None:
+    """Reuse unique-subtask metadata across task graph instances."""
+    for node in sorted(graph.nodes, key=lambda name: int(str(name).rsplit("_", 1)[1])):
+        local_index = str(node).rsplit("_", 1)[-1]
+        unique_id = f"subtask_{local_index}"
+        attributes = graph.nodes[node]
+        required_data = dict(attributes.get("required_data", {}))
+        upstream_outputs = list(required_data.get("upstream_outputs", []))
+
+        if unique_id not in templates:
+            templates[unique_id] = {
+                "iot_features": list(required_data.get("iot_features", [])),
+                "gating_weights": list(attributes.get("gating_weights", [])),
+                "expert_confidence": list(attributes.get("expert_confidence", [])),
+                "reconstruction_errors": list(attributes.get("reconstruction_errors", [])),
+                "reconstruction_loss": float(attributes.get("reconstruction_loss", 0.0)),
+                "calibration_losses": list(attributes.get("calibration_losses", [])),
+            }
+
+        template = templates[unique_id]
+        required_data["iot_features"] = list(template["iot_features"])
+        required_data["upstream_outputs"] = upstream_outputs
+        attributes["required_data"] = required_data
+        attributes["unique_subtask_id"] = unique_id
+        attributes["gating_weights"] = list(template["gating_weights"])
+        attributes["expert_confidence"] = list(template["expert_confidence"])
+        attributes["reconstruction_errors"] = list(template["reconstruction_errors"])
+        attributes["reconstruction_loss"] = float(template["reconstruction_loss"])
+        attributes["calibration_losses"] = list(template["calibration_losses"])
+
+
 def generate_multiple_dags(
     specs: Sequence[DAGSpec],
     output_dir: Path,
@@ -635,6 +669,7 @@ def generate_multiple_dags(
     rng = random.Random(seed)
 
     graphs: list[nx.DiGraph] = []
+    unique_subtask_templates: dict[str, dict[str, object]] = {}
 
     for graph_index, spec in enumerate(specs, start=1):
         deadline_seconds = make_task_deadline_seconds(
@@ -656,6 +691,7 @@ def generate_multiple_dags(
             calibration_loss_range=calibration_loss_range,
             deadline_seconds=deadline_seconds,
         )
+        apply_unique_subtask_templates(graph, unique_subtask_templates)
         graphs.append(graph)
 
         if not export_artifacts:
@@ -708,4 +744,3 @@ def generate_multiple_dags(
         print(f"  JSON:    {json_path}")
 
     return graphs
-

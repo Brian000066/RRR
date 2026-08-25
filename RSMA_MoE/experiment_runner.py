@@ -30,6 +30,7 @@ class AverageResult:
     activation_cost: float
     bandwidth_cost: float
     forwarding_cost: float
+    inference_cost: float
     violation_count: float
     activation_usage: float = 0.0
     bandwidth_usage: float = 0.0
@@ -251,7 +252,7 @@ def print_diagnostics(result: Any, config: ExperimentConfig) -> None:
     print("Diagnostics:")
     print(
         "  Assignment: "
-        f"activation_count={format_number(diagnostics['activation_usage'])}, "
+        f"activation_memory={format_number(diagnostics['activation_usage'])}, "
         f"avg_servers/subtask={diagnostics['avg_servers_per_subtask']:.2f}, "
         f"avg_experts/subtask={diagnostics['avg_experts_per_subtask']:.2f}"
     )
@@ -265,9 +266,10 @@ def print_method_result(method_name: str, result_path, result: Any, config: Expe
     print(f"{method_name} result: {result_path.resolve()}")
     print(f"{method_name} total cost: {rounded_cost(result.total_cost)}")
     print("Cost breakdown:")
-    print_cost_line("Activation", result.activation_cost, config.c_act, "server-expert activations")
+    print_cost_line("Activation", result.activation_cost, config.c_act, "activated expert memory")
     print_cost_line("Bandwidth", result.bandwidth_cost, config.c_bw, "Hz")
     print_cost_line("Forwarding", result.forwarding_cost, config.c_fwd, "forwarding events")
+    print_cost_line("Inference", getattr(result, "inference_cost", 0.0), 1.0, "expert inference cost units")
     print_diagnostics(result, config)
     print(f"{method_name} violations: {len(result.violations)}")
     if method_name == "JRGEP" and graphs is not None:
@@ -323,6 +325,7 @@ COST_COLORS = {
     "Activation": "#4C78A8",
     "Bandwidth": "#F58518",
     "Forwarding": "#54A24B",
+    "Inference": "#B279A2",
 }
 
 
@@ -396,7 +399,7 @@ def show_cost_breakdown_plot(
     method_names = [METHOD_DISPLAY_NAMES.get(key, key) for key in results]
     fig, axis = plt.subplots(figsize=(9, 5.6))
     bottoms = [0 for _ in method_names]
-    for label in ("Activation", "Bandwidth", "Forwarding"):
+    for label in ("Activation", "Bandwidth", "Forwarding", "Inference"):
         values = [rounded_cost(getattr(result, f"{label.lower()}_cost")) for result in results.values()]
         bars = axis.bar(
             method_names,
@@ -557,7 +560,7 @@ def print_run_summary(run_number: int, results: dict[str, Any], config: Experime
         diagnostics = result_diagnostics(result, config)
         parts.append(
             f"{name}: total={rounded_cost(result.total_cost)}, "
-            f"act={format_number(diagnostics['activation_usage'])}, "
+            f"act_mem={format_number(diagnostics['activation_usage'])}, "
             f"bw={format_number(diagnostics['bandwidth_usage'])}Hz, "
             f"fwd={format_number(diagnostics['forwarding_usage'])}, "
             f"srv/sub={diagnostics['avg_servers_per_subtask']:.2f}, "
@@ -582,6 +585,7 @@ def average_run_results(run_results: list[dict[str, Any]], config: ExperimentCon
             activation_cost=sum(result.activation_cost for result in method_results) / count,
             bandwidth_cost=sum(result.bandwidth_cost for result in method_results) / count,
             forwarding_cost=sum(result.forwarding_cost for result in method_results) / count,
+            inference_cost=sum(getattr(result, "inference_cost", 0.0) for result in method_results) / count,
             violation_count=sum(len(result.violations) for result in method_results) / count,
             activation_usage=sum(item["activation_usage"] for item in diagnostics) / count,
             bandwidth_usage=sum(item["bandwidth_usage"] for item in diagnostics) / count,
@@ -599,13 +603,14 @@ def print_average_results(averages: dict[str, AverageResult], config: Experiment
         method_name = METHOD_DISPLAY_NAMES.get(method_key, method_key)
         print(f"{method_name} average total cost: {result.total_cost:.2f} ({rounded_cost(result.total_cost)})")
         print("Average cost breakdown:")
-        print_cost_line("Activation", result.activation_cost, config.c_act, "server-expert activations")
+        print_cost_line("Activation", result.activation_cost, config.c_act, "activated expert memory")
         print_cost_line("Bandwidth", result.bandwidth_cost, config.c_bw, "Hz")
         print_cost_line("Forwarding", result.forwarding_cost, config.c_fwd, "forwarding events")
+        print_cost_line("Inference", result.inference_cost, 1.0, "expert inference cost units")
         print("Average diagnostics:")
         print(
             "  Assignment: "
-            f"activation_count={result.activation_usage:.2f}, "
+            f"activation_memory={result.activation_usage:.2f}, "
             f"avg_servers/subtask={result.avg_servers_per_subtask:.2f}, "
             f"avg_experts/subtask={result.avg_experts_per_subtask:.2f}"
         )
@@ -671,8 +676,6 @@ def run_experiment(config: ExperimentConfig | None = None) -> dict[str, Any]:
         filename=None,
     )
     return averages
-
-
 
 
 

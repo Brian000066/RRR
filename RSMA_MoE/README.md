@@ -119,7 +119,7 @@ Baseline 不是 random expert。Baseline 的 expert 仍照 Top-K 或 WDMoE 選�
 
 | 參數 | 目前值 | 說明 |
 |---|---:|---|
-| `c_act` | `20.0` | 每個 server-expert activation cost。 |
+| `c_act` | `20.0` | 每單位 expert model size activation cost。 |
 | `c_bw` | `0.05` | 每 Hz bandwidth cost。 |
 | `c_fwd` | `1.0` | 每個 forwarding / backhaul hop cost。 |
 
@@ -128,11 +128,15 @@ Baseline 不是 random expert。Baseline 的 expert 仍照 Top-K 或 WDMoE 選�
 ### Objective
 
 ```text
-Total cost = Activation cost + Bandwidth cost + Forwarding cost
+Total cost = Activation cost + Inference cost + Bandwidth cost + Forwarding cost
 ```
 
 ```text
-Activation cost = c_act * |{(s,p): expert p is activated on server s}|
+Activation cost = c_act * sum_{(s,p) activated} M_p
+```
+
+```text
+Inference cost = sum_{subtask i,j} sum_{selected p} c_inf_p
 ```
 
 ```text
@@ -164,10 +168,10 @@ P(P_sel | v) = sum_{p in selected experts} G_p(v) * pi(p | v)
 
 `G_p(v)` 是 gating weight，`pi(p|v)` 是 expert confidence。
 
-目前 reconstruction loss 用 required features 的 missing count：
+目前 reconstruction loss 使用 required features 對應的 synthetic reconstruction error；缺失 feature 會貢獻 squared error：
 
 ```text
-L_rec = missing_feature_count / (2 * sigma^2)
+L_rec = sum_{missing feature k} error_k^2 / (2 * sigma^2)
 ```
 
 若同一個 subtask 選到多個 expert，reconstruction loss 以 selected expert 為單位加權平均：
@@ -195,19 +199,23 @@ L(P_sel, v_j^i) <= q_hat_j^i
 每個 group 只計一次 bandwidth：
 
 ```text
-B_g = max(common_volume / (T_g * common_efficiency),
-          max_n private_volume_n / (T_g * private_efficiency_n))
+B_g = common_volume / (T_g * common_efficiency)
+      + sum_n private_volume_n / (T_g * private_efficiency_n)
 ```
 
-`T_g` 由依賴該 group 的 subtasks 中最緊的 remaining time 決定。
+`T_g` 由依賴該 group 的 subtasks 中最緊的 remaining time 決定。為符合 minimum data-rate constraint，實作也會讓 `B_g` 不低於每條 active common/private stream 達到 `R_min` 所需的 bandwidth。
 
 common stream 使用 distributed beamforming gain：
 
 ```text
-SINR_common = DB_gain(g) * common_signal / (private_interference + noise)
+R_common = B_g * log2(1 + DB_gain(g) * common_signal / (private_interference + noise))
 ```
 
-private stream 使用 scalar channel gain 和 spatial correlation 計算 interference。
+private stream 使用 PDF System Model 的 scalar channel gain interference：
+
+```text
+R_private,n = B_g * log2(1 + private_signal_n / (sum_{m != n} private_interference_m + noise))
+```
 
 ### Timing
 
@@ -218,6 +226,11 @@ T_start(s,i,j) = max(feature_ready_time, predecessor_ready_time)
 ```
 
 同 server 的 predecessor output 不需要 forwarding time；不同 server 需要加 wired transmission time。
+多個 selected experts 的輸出會先聚合成固定大小 intermediate output，因此 predecessor forwarding volume 不再乘上 expert 數。
+
+### Assignment / Activation
+
+每個 subtask 必須指派到剛好一台 MEC server；該 subtask 的所有 selected experts 都必須部署在同一台 assigned server 上，且至少選一個 expert。Evaluator 會檢查 C8 single-server assignment 與 C9 expert activation constraints。
 
 ## Baseline 流程
 
