@@ -20,6 +20,7 @@ class ExpertSpec:
     index: int
     memory: float = 0.0
     latency: float = 1.0
+    inference_cost: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class DeviceSpec:
 @dataclass(frozen=True)
 class SubtaskSpec:
     id: SubtaskId
+    unique_id: Optional[str] = None
     required_features: Set[str] = field(default_factory=set)
     predecessors: Set[SubtaskId] = field(default_factory=set)
     output_tokens: int = 256
@@ -57,6 +59,7 @@ class SubtaskSpec:
     gating_weights: Tuple[float, ...] = field(default_factory=tuple)
     expert_confidence: Tuple[float, ...] = field(default_factory=tuple)
     reconstruction_loss: float = 0.0
+    reconstruction_errors_by_feature: Dict[str, float] = field(default_factory=dict)
     calibration_losses: Tuple[float, ...] = field(default_factory=tuple)
     loss_threshold: Optional[float] = None
     max_loss: Optional[float] = None
@@ -103,6 +106,7 @@ class FormulationConfig:
     reconstruction_sigma: float = 1.0
     min_selection_probability: float = 1e-12
     deadline_tolerance: float = 1e-3
+    enforce_single_server_assignment: bool = True
 
 
 @dataclass
@@ -110,10 +114,16 @@ class ObjectiveBreakdown:
     activation_cost: float
     forwarding_cost: float
     bandwidth_cost: float
+    inference_cost: float = 0.0
 
     @property
     def total_cost(self) -> float:
-        return self.activation_cost + self.forwarding_cost + self.bandwidth_cost
+        return (
+            self.activation_cost
+            + self.forwarding_cost
+            + self.bandwidth_cost
+            + self.inference_cost
+        )
 
 
 @dataclass
@@ -206,41 +216,9 @@ def normalize_experts(experts: Mapping[str, Any]) -> Dict[ExpertId, ExpertSpec]:
             index=int(parsed_index),
             memory=float(_first(data, ("memory", "mem", "memory_size"), 0.0)),
             latency=float(_first(data, ("latency", "inference_latency", "tau"), 1.0)),
+            inference_cost=float(_first(data, ("inference_cost", "c_inf", "execution_cost"), 0.0)),
         )
     return normalized
-
-
-def siot_rate_mapping(sinr: float) -> float:
-    """SIoT MCS-to-rate mapping copied from SIoT_Algo/config.py."""
-    if sinr <= -9.478:
-        return 0.5
-    if sinr <= -6.658:
-        return 1.2
-    if sinr <= -4.098:
-        return 2.4
-    if sinr <= -1.798:
-        return 3.5
-    if sinr <= 0.399:
-        return 4.2
-    if sinr <= 2.424:
-        return 5.1
-    if sinr <= 4.489:
-        return 6.0
-    if sinr <= 6.367:
-        return 7.6
-    if sinr <= 8.456:
-        return 8.8
-    if sinr <= 10.266:
-        return 9.5
-    if sinr <= 12.218:
-        return 10.2
-    if sinr <= 14.122:
-        return 20.4
-    if sinr <= 15.849:
-        return 30.3
-    if sinr <= 17.786:
-        return 40.0
-    return 50.0
 
 
 def normalize_servers(servers: Iterable[Any]) -> Dict[ServerId, ServerSpec]:
@@ -306,16 +284,33 @@ def normalize_tasks(tasks: Iterable[Any]) -> Dict[TaskId, TaskSpec]:
         for sub_index, sub_raw in enumerate(raw_subtasks):
             sub = sub_raw if isinstance(sub_raw, Mapping) else vars(sub_raw)
             subtask_id = str(_first(sub, ("subtask_id", "id", "node_id"), sub_index))
+            required_features = as_set(_first(sub, ("required_features", "features"), set()))
+            raw_errors = _first(sub, ("reconstruction_errors_by_feature", "reconstruction_errors"), {})
+            if isinstance(raw_errors, Mapping):
+                reconstruction_errors = {
+                    str(feature): float(error)
+                    for feature, error in raw_errors.items()
+                    if str(feature) in required_features
+                }
+            elif isinstance(raw_errors, (list, tuple)):
+                reconstruction_errors = {
+                    feature: float(error)
+                    for feature, error in zip(sorted(required_features), raw_errors)
+                }
+            else:
+                reconstruction_errors = {}
             subtasks.append(
                 SubtaskSpec(
                     id=subtask_id,
-                    required_features=as_set(_first(sub, ("required_features", "features"), set())),
+                    unique_id=str(_first(sub, ("unique_id", "unique_subtask_id"), subtask_id)),
+                    required_features=required_features,
                     predecessors=as_set(_first(sub, ("predecessors", "parents"), set())),
                     output_tokens=int(_first(sub, ("output_tokens", "max_output_tokens"), 256)),
                     feature_volume_bits=float(_first(sub, ("feature_volume_bits", "feature_bits"), 0.0)),
                     gating_weights=tuple(float(value) for value in _first(sub, ("gating_weights", "gating"), [])),
                     expert_confidence=tuple(float(value) for value in _first(sub, ("expert_confidence", "pi"), [])),
                     reconstruction_loss=float(_first(sub, ("reconstruction_loss", "L_rec"), 0.0)),
+                    reconstruction_errors_by_feature=reconstruction_errors,
                     calibration_losses=tuple(float(value) for value in _first(sub, ("calibration_losses", "D_cal"), [])),
                     loss_threshold=_first(sub, ("loss_threshold", "q", "q_hat"), None),
                     max_loss=_first(sub, ("max_loss", "loss"), None),
@@ -366,7 +361,17 @@ class FormulationEvaluator:
         backhaul: Set[Tuple[ServerId, GroupId, ServerId]],
     ) -> ObjectiveBreakdown:
         activated = {(server_id, expert_id) for pairs in assignments.values() for server_id, expert_id in pairs}
-        activation_cost = self.config.c_act * len(activated)
+        activation_cost = self.config.c_act * sum(
+            self.experts[expert_id].memory
+            for _, expert_id in activated
+            if expert_id in self.experts
+        )
+        inference_cost = sum(
+            self.experts[expert_id].inference_cost
+            for pairs in assignments.values()
+            for _, expert_id in pairs
+            if expert_id in self.experts
+        )
         bandwidth_cost = self.config.c_bw * sum(group.bandwidth for group in groups)
         forwarding_cost = 0.0
 
@@ -389,7 +394,7 @@ class FormulationEvaluator:
             if group and src_server != dst_server:
                 forwarding_cost += self.config.c_fwd * self.wired_weight(src_server, dst_server)
 
-        return ObjectiveBreakdown(activation_cost, forwarding_cost, bandwidth_cost)
+        return ObjectiveBreakdown(activation_cost, forwarding_cost, bandwidth_cost, inference_cost)
 
     def resolve_group_bandwidths(
         self,
@@ -458,9 +463,8 @@ class FormulationEvaluator:
         group_by_key = {(group.server_id, group.id): group for group in groups}
         feature_to_groups: Dict[str, List[GroupSpec]] = {}
         for group in groups:
-            for device_id in group.devices:
-                for feature in self.devices[device_id].features:
-                    feature_to_groups.setdefault(feature, []).append(group)
+            for feature in self.group_payload_features(group):
+                feature_to_groups.setdefault(feature, []).append(group)
 
         dependencies: Dict[Tuple[ServerId, GroupId], Set[AssignmentKey]] = {
             key: set() for key in group_by_key
@@ -547,8 +551,8 @@ class FormulationEvaluator:
             for device_id in group.devices
         )
         db_gain = self.distributed_beamforming_gain(group)
-        common_sinr = db_gain * common_signal / (private_interference + self.config.noise_power)
-        common_efficiency = siot_rate_mapping(common_sinr)
+        common_sinr = common_signal / (private_interference + self.config.noise_power)
+        common_efficiency = log2(1.0 + max(db_gain, 0.0) * max(common_sinr, 0.0))
 
         private_efficiencies: Dict[DeviceId, float] = {}
         for device_id in group.devices:
@@ -561,10 +565,9 @@ class FormulationEvaluator:
                 interference += (
                     self.effective_channel_gain(other_id, group.server_id, group) ** 2
                     * group.private_power.get(other_id, self.default_private_power(other_id))
-                    * self.spatial_correlation(device_id, other_id, group.server_id)
                 )
             private_sinr = signal / (interference + self.config.noise_power)
-            private_efficiencies[device_id] = siot_rate_mapping(private_sinr)
+            private_efficiencies[device_id] = log2(1.0 + max(private_sinr, 0.0))
         return common_efficiency, private_efficiencies
 
     def derive_group_bandwidth(self, group: GroupSpec) -> float:
@@ -575,17 +578,28 @@ class FormulationEvaluator:
             return 0.0
         budget = max(float(budget), 1e-12)
         common_efficiency, private_efficiencies = self.group_spectral_efficiencies(group)
+        common_volume = self.group_common_volume(group)
         common_required = self.group_common_volume(group) / (
             budget * max(common_efficiency, 1e-12)
         )
 
         private_required = 0.0
+        min_rate_required = 0.0
+        if common_volume > 0.0:
+            min_rate_required = max(
+                min_rate_required,
+                self.config.min_rate / max(common_efficiency, 1e-12),
+            )
         for device_id in group.devices:
             private_volume = self.group_private_volume(group, device_id)
             efficiency = max(private_efficiencies.get(device_id, 0.0), 1e-12)
-            private_required = max(private_required, private_volume / (budget * efficiency))
+            private_required += private_volume / (budget * efficiency)
+            min_rate_required = max(
+                min_rate_required,
+                self.config.min_rate / efficiency,
+            )
 
-        return max(common_required, private_required)
+        return max(common_required + private_required, min_rate_required)
 
     def compute_rates(
         self, groups: Sequence[GroupSpec]
@@ -693,6 +707,38 @@ class FormulationEvaluator:
                 loss = sub.max_loss if sub.max_loss is not None else self.estimated_loss_for_assignment(key, assignments, subtask_features)
                 if loss > threshold:
                     violations.append(f"C3 performance loss: {(task.id, sub.id)} loss {loss:.6g} > {threshold:.6g}")
+
+        if self.config.enforce_single_server_assignment:
+            for task in self.tasks.values():
+                for subtask in task.subtasks:
+                    key = (task.id, subtask.id)
+                    pairs = list(assignments.get(key, []))
+                    servers = {server_id for server_id, _ in pairs}
+                    expert_ids = [expert_id for _, expert_id in pairs]
+                    if len(servers) != 1:
+                        violations.append(
+                            f"C8 single-server assignment: {key} uses {len(servers)} servers"
+                        )
+                    if not pairs:
+                        violations.append(
+                            f"C8 single-server assignment: {key} has no selected expert"
+                        )
+                    if len(set(expert_ids)) != len(expert_ids):
+                        violations.append(
+                            f"C8 single-server assignment: {key} selects a duplicate expert"
+                        )
+                    for server_id, expert_id in pairs:
+                        server = self.servers.get(server_id)
+                        if server is None:
+                            violations.append(
+                                f"C9 expert activation: {key} selects {expert_id} on unknown server {server_id}"
+                            )
+                            continue
+                        if expert_id not in server.stored_experts:
+                            violations.append(
+                                f"C9 expert activation: {key} selects expert {expert_id} "
+                                f"not deployed on server {server_id}"
+                            )
 
         for group in groups:
             if len(group.devices) > self.config.max_group_size:
@@ -827,16 +873,13 @@ class FormulationEvaluator:
         """Distributed beamforming gain for the RSMA common stream."""
         if not group.devices:
             return 0.0
-        common_ratio = self.common_message_ratio(group)
-        if common_ratio <= 0.0:
-            return 0.0
 
         weighted_terms = []
         magnitudes = []
         for device_id in group.devices:
             gain = self.channel_gain(device_id, group.server_id)
             power = group.common_power.get(device_id, self.default_common_power(device_id))
-            weight = (max(power * common_ratio, 0.0) ** 0.5) * gain
+            weight = (max(power, 0.0) ** 0.5) * gain
             weighted_terms.append(weight * self.db_phase_term(device_id, group.server_id))
             magnitudes.append(weight)
 
@@ -874,12 +917,16 @@ class FormulationEvaluator:
         payload: Set[str] = set()
         for device_id in group.devices:
             payload.update(self.devices[device_id].features)
+        if group.required_features:
+            payload &= set(group.required_features)
         return payload
 
     def group_common_features(self, group: GroupSpec) -> Set[str]:
         if not group.devices:
             return set()
         payload = self.group_payload_features(group)
+        if not payload:
+            return set()
         common = set(self.devices[group.devices[0]].features) & payload
         for device_id in group.devices[1:]:
             common &= self.devices[device_id].features
@@ -918,6 +965,8 @@ class FormulationEvaluator:
                 if feature not in device.features or device_id not in group_by_device:
                     continue
                 group = group_by_device[device_id]
+                if feature not in self.group_payload_features(group):
+                    continue
                 arrival = uplink.get((group.server_id, group.id), 0.0)
                 if group.server_id != target_server:
                     if (group.server_id, group.id, target_server) not in backhaul:
@@ -986,8 +1035,8 @@ class FormulationEvaluator:
     ) -> float:
         subtask = self.subtask_by_key(key)
         output_tokens = subtask.output_tokens if subtask is not None else 256
-        expert_count = len(self.selected_experts_on_server(assignments, key, server_id))
-        return expert_count * output_tokens * self.config.output_token_bits
+        del server_id, assignments
+        return output_tokens * self.config.output_token_bits
 
     def subtask_by_key(self, key: AssignmentKey) -> Optional[SubtaskSpec]:
         task = self.tasks.get(key[0])
@@ -1095,11 +1144,17 @@ class FormulationEvaluator:
         if not required_features:
             return 0.0
         selected = set() if selected_features is None else set(selected_features)
-        missing_count = len(required_features - selected)
-        if missing_count <= 0:
+        missing = required_features - selected
+        if not missing:
             return 0.0
         sigma_sq = max(self.config.reconstruction_sigma ** 2, 1e-12)
-        return missing_count / (2.0 * sigma_sq)
+        if subtask.reconstruction_errors_by_feature:
+            squared_error = sum(
+                subtask.reconstruction_errors_by_feature.get(feature, 1.0) ** 2
+                for feature in missing
+            )
+            return squared_error / (2.0 * sigma_sq)
+        return len(missing) / (2.0 * sigma_sq)
 
     def performance_loss_from_probability(
         self,
@@ -1161,5 +1216,3 @@ def complex_phase(phase: float) -> complex:
     from cmath import exp
 
     return exp(1j * phase)
-
-
