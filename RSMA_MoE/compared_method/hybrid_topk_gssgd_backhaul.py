@@ -44,7 +44,7 @@ class HybridTopKGSSGDBackhaulPipeline(ChainedComparisonPipeline):
         for features in server_required_features.values():
             globally_required.update(features)
         for server_id in self.servers:
-            local_devices = [device_id for device_id, device in self.devices.items() if device.home_server == server_id]
+            local_devices = self._server_transmittable_devices(server_id)
             local_required = globally_required & self._server_local_features(local_devices)
             if not local_required:
                 continue
@@ -222,6 +222,7 @@ def run_hybrid_topk_gssgd_backhaul(
             "activation": c_act,
             "bandwidth": c_bw,
             "forwarding": c_fwd,
+            "inference": 1.0,
         },
         "gssgd_parameters": {
             "top_k": top_k,
@@ -240,7 +241,7 @@ def run_hybrid_topk_gssgd_backhaul(
             "server_gpu_memory_range": server_gpu_memory_range,
             "wired_rate_range": wired_rate_range,
             "wired_extra_link_probability": wired_extra_link_probability,
-            "bandwidth_mode": "derived_by_group_slack",
+            "bandwidth_mode": "pdf_equivalent_bandwidth_demand_by_group_slack",
             "default_feature_bits": default_feature_bits,
             "feature_bits_range": feature_bits_range,
             "feature_bits_by_name": feature_bits_by_name,
@@ -265,17 +266,13 @@ def run_hybrid_topk_gssgd_backhaul(
             result_to_jsonable(
                 result,
                 network_context,
-                cost_units={"activation": c_act, "bandwidth": c_bw, "forwarding": c_fwd},
+                cost_units={"activation": c_act, "bandwidth": c_bw, "forwarding": c_fwd, "inference": 1.0},
             ),
             file,
             ensure_ascii=False,
             indent=2,
         )
     return result
-
-
-
-
 
 
 

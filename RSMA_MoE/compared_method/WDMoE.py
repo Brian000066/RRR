@@ -213,8 +213,8 @@ class WDMoEExpertSelectionMixin:
                 activated=activated,
                 used_memory=used_memory,
             )
-            # This server cannot provide enough experts
-            if len(baseline_experts) < self.top_k:
+            # This server cannot execute the subtask without any expert.
+            if not baseline_experts:
                 continue
 
             # 2. Calculate latency assuming the entire node
@@ -661,6 +661,7 @@ def _run_wdmoe_pipeline(
             "activation": c_act,
             "bandwidth": c_bw,
             "forwarding": c_fwd,
+            "inference": 1.0,
         },
         "wdmoe_parameters": {
             "algorithm": "WDMoE-Based DAG-Aware Expert Selection",
@@ -687,7 +688,7 @@ def _run_wdmoe_pipeline(
             "server_gpu_memory_range": server_gpu_memory_range,
             "wired_rate_range": wired_rate_range,
             "wired_extra_link_probability": wired_extra_link_probability,
-            "bandwidth_mode": "derived_by_group_slack",
+            "bandwidth_mode": "pdf_equivalent_bandwidth_demand_by_group_slack",
             "default_feature_bits": default_feature_bits,
             "feature_bits_range": feature_bits_range,
             "feature_bits_by_name": feature_bits_by_name,
@@ -710,7 +711,7 @@ def _run_wdmoe_pipeline(
     payload = hybrid_result_to_jsonable(
         result,
         network_context,
-        cost_units={"activation": c_act, "bandwidth": c_bw, "forwarding": c_fwd},
+        cost_units={"activation": c_act, "bandwidth": c_bw, "forwarding": c_fwd, "inference": 1.0},
     )
     payload["method"] = method_name
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -747,10 +748,6 @@ def run_wdmoe_gssgd(
         output_path,
         **kwargs,
     )
-
-
-
-
 
 
 

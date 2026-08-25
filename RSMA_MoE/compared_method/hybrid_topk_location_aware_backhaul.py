@@ -63,13 +63,14 @@ class ChainedPipelineResult:
     activation_cost: float
     bandwidth_cost: float
     forwarding_cost: float
+    inference_cost: float = 0.0
     backhaul: Set[BackhaulEdge] = field(default_factory=set)
     violations: List[str] = field(default_factory=list)
     evaluation: Optional[EvaluationResult] = None
 
 
 class ChainedComparisonPipeline:
-    allow_expert_loss_repair: bool = False
+    allow_expert_loss_repair: bool = True
     activate_all_candidate_groups: bool = False
 
     def __init__(
@@ -151,6 +152,7 @@ class ChainedComparisonPipeline:
             activation_cost=evaluation.objective.activation_cost,
             bandwidth_cost=evaluation.objective.bandwidth_cost,
             forwarding_cost=evaluation.objective.forwarding_cost,
+            inference_cost=evaluation.objective.inference_cost,
             backhaul=backhaul,
             violations=violations,
             evaluation=evaluation,
@@ -185,7 +187,15 @@ class ChainedComparisonPipeline:
 
                 while self.allow_expert_loss_repair and loss > threshold + 1e-12:
                     selected_experts = selected_experts_by_key.setdefault(key, set())
-                    candidate = self._best_repair_candidate(subtask, selected_experts, activated, used_memory)
+                    target_servers = self.evaluator.participating_servers(assignments, key)
+                    assigned_server = target_servers[0] if len(target_servers) == 1 else None
+                    candidate = self._best_repair_candidate(
+                        subtask,
+                        selected_experts,
+                        activated,
+                        used_memory,
+                        assigned_server=assigned_server,
+                    )
                     if candidate is None:
                         break
                     server_id, expert_id = candidate
@@ -241,9 +251,9 @@ class ChainedComparisonPipeline:
                         selected.append((server_id, expert_id))
                         selected_experts.add(expert_id)
                         self._activate(server_id, expert_id, activated, used_memory)
-                if len(selected) < min(self.top_k, len(self.experts)):
+                if not selected:
                     self.scheduler_violations.append(
-                        f"TopK placement: only {len(selected)} feasible experts for {key}; target {self.top_k}"
+                        f"TopK placement: no feasible expert on any single server for {key}"
                     )
                 assignments[key] = selected
                 selected_experts_by_key[key] = selected_experts
@@ -258,6 +268,11 @@ class ChainedComparisonPipeline:
         used_memory,
     ):
         candidates = []
+        threshold = None
+        try:
+            threshold = self.evaluator.conformal_loss_threshold(subtask)
+        except Exception:
+            threshold = None
 
         for server_id, server in self.servers.items():
 
@@ -297,11 +312,18 @@ class ChainedComparisonPipeline:
                 self._expert_score(subtask, expert_id)
                 for expert_id in feasible_experts
             )
+            pairs = tuple((server_id, expert_id) for expert_id in feasible_experts)
+            probability = self.evaluator.selection_probability(subtask, set(feasible_experts))
+            rec_loss = self._estimated_local_reconstruction_for_pairs(subtask, pairs)
+            loss = self.evaluator.performance_loss_from_probability_and_reconstruction(probability, rec_loss)
+            threshold_penalty = 0 if threshold is not None and loss <= threshold + 1e-12 else 1
 
             candidates.append(
                 (
-                    len(feasible_experts),
-                    score,
+                    threshold_penalty,
+                    loss,
+                    -len(feasible_experts),
+                    -score,
                     server_id,
                     feasible_experts,
                 )
@@ -310,16 +332,35 @@ class ChainedComparisonPipeline:
         if not candidates:
             return None, []
 
-        # 優先：
-        # 1. 能提供較多 experts 的 server
-        # 2. expert suitability / gating score 較高
+        # Prefer a server whose local feature/expert combination is already
+        # closest to satisfying the PDF performance-loss constraint.
         candidates.sort(
-            key=lambda x: (-x[0], -x[1], str(x[2]))
+            key=lambda x: (x[0], x[1], x[2], x[3], str(x[4]))
         )
 
-        _, _, server_id, expert_ids = candidates[0]
+        _, _, _, _, server_id, expert_ids = candidates[0]
 
         return server_id, expert_ids
+
+    def _estimated_local_reconstruction_for_pairs(
+        self,
+        subtask: SubtaskSpec,
+        selected_pairs: Sequence[Tuple[ServerId, ExpertId]],
+    ) -> float:
+        required = set(subtask.required_features)
+        if not required:
+            return 0.0
+        weighted_loss = 0.0
+        total_experts = 0
+        for server_id, _ in selected_pairs:
+            local_features = self._server_local_features(
+                self._server_transmittable_devices(server_id)
+            ) & required
+            weighted_loss += self.evaluator.reconstruction_loss_for_features(subtask, local_features)
+            total_experts += 1
+        if total_experts <= 0:
+            return subtask.reconstruction_loss
+        return weighted_loss / total_experts
 
     def _repair_loss_with_groups(
         self,
@@ -401,7 +442,14 @@ class ChainedComparisonPipeline:
 
                 while self.allow_expert_loss_repair and loss > threshold + 1e-12:
                     selected_experts = selected_experts_by_key.setdefault(key, set())
-                    candidate = self._best_repair_candidate(subtask, selected_experts, activated, used_memory)
+                    assigned_server = target_servers[0] if len(target_servers) == 1 else None
+                    candidate = self._best_repair_candidate(
+                        subtask,
+                        selected_experts,
+                        activated,
+                        used_memory,
+                        assigned_server=assigned_server,
+                    )
                     if candidate is None:
                         break
                     server_id, expert_id = candidate
@@ -443,6 +491,30 @@ class ChainedComparisonPipeline:
 
     def _server_feature_set(self, subtask_features, key: AssignmentKey, server_id: ServerId) -> Set[str]:
         return subtask_features.setdefault(self._server_feature_key(key, server_id), set())
+
+    def _device_can_transmit_to_server(self, device_id: DeviceId, server_id: ServerId) -> bool:
+        device = self.devices[device_id]
+        return server_id in device.channel_gain or device.home_server == server_id
+
+    def _server_transmittable_devices(self, server_id: ServerId) -> List[DeviceId]:
+        return [
+            device_id
+            for device_id in self.devices
+            if self._device_can_transmit_to_server(device_id, server_id)
+        ]
+
+    def _group_available_with_active_devices(
+        self,
+        group: GroupSpec,
+        active_groups: Mapping[GroupKey, GroupSpec],
+    ) -> bool:
+        group_key = (group.server_id, group.id)
+        if group_key in active_groups:
+            return True
+        active_devices: Set[DeviceId] = set()
+        for active_group in active_groups.values():
+            active_devices.update(active_group.devices)
+        return not (set(group.devices) & active_devices)
 
     def _activate_local_groups_for_subtask(
         self,
@@ -513,6 +585,7 @@ class ChainedComparisonPipeline:
                 group
                 for group in candidate_groups
                 if group.server_id == target_server and group.required_features & missing
+                and self._group_available_with_active_devices(group, active_groups)
             ]
             for group in usable:
                 trial_features = dict((k, set(v)) for k, v in subtask_features.items())
@@ -634,6 +707,7 @@ class ChainedComparisonPipeline:
                 group
                 for group in candidate_groups
                 if group.server_id != target_server and group.required_features & missing
+                and self._group_available_with_active_devices(group, active_groups)
             ]
             for group in usable:
                 trial_features = dict((k, set(v)) for k, v in subtask_features.items())
@@ -694,7 +768,7 @@ class ChainedComparisonPipeline:
         for target_server in target_servers:
             edge = (group.server_id, group.id, target_server)
             if group.server_id != target_server and edge not in active_backhaul:
-                cost += self.config.c_fwd
+                cost += self.config.c_fwd * self.evaluator.wired_weight(group.server_id, target_server)
         return cost
 
     def _subtask_bandwidth_budget(
@@ -758,7 +832,14 @@ class ChainedComparisonPipeline:
     def _best_server_for_expert(self, expert_id, activated, used_memory):
         return self._random_server_for_expert(expert_id, activated, used_memory)
 
-    def _best_repair_candidate(self, subtask, selected_experts, activated, used_memory):
+    def _best_repair_candidate(
+        self,
+        subtask,
+        selected_experts,
+        activated,
+        used_memory,
+        assigned_server: Optional[ServerId] = None,
+    ):
         candidates = []
         for expert_id in sorted(self.experts):
             if expert_id in selected_experts:
@@ -766,7 +847,12 @@ class ChainedComparisonPipeline:
             contribution = self.evaluator.expert_contribution(subtask, expert_id)
             if contribution <= 0.0:
                 continue
-            server_id = self._random_server_for_expert(expert_id, activated, used_memory)
+            if assigned_server is None:
+                server_id = self._random_server_for_expert(expert_id, activated, used_memory)
+            elif assigned_server in self._feasible_servers_for_expert(expert_id, activated, used_memory):
+                server_id = assigned_server
+            else:
+                server_id = None
             if server_id is None:
                 continue
             expert = self.experts[expert_id]
@@ -810,7 +896,7 @@ class ChainedComparisonPipeline:
         for features in server_required_features.values():
             globally_required.update(features)
         for server_id in self.servers:
-            local_devices = [did for did, dev in self.devices.items() if dev.home_server == server_id]
+            local_devices = self._server_transmittable_devices(server_id)
             local_required = globally_required & self._server_local_features(local_devices)
             if not local_required:
                 continue
@@ -1049,9 +1135,8 @@ class ChainedComparisonPipeline:
     def _feature_to_groups(self, groups):
         feature_to_groups: Dict[str, List[GroupSpec]] = {}
         for group in groups:
-            for device_id in group.devices:
-                for feature in self.devices[device_id].features:
-                    feature_to_groups.setdefault(feature, []).append(group)
+            for feature in self.evaluator.group_payload_features(group):
+                feature_to_groups.setdefault(feature, []).append(group)
         return feature_to_groups
 
     def _activated_expert_map(self, assignments):
@@ -1110,10 +1195,11 @@ def _cost_breakdown(result: ChainedPipelineResult, cost_units: Mapping[str, floa
     c_act = float(cost_units.get("activation", 0.0))
     c_bw = float(cost_units.get("bandwidth", 0.0))
     c_fwd = float(cost_units.get("forwarding", 0.0))
+    c_inf = float(cost_units.get("inference", 1.0))
     return {
         "activation": {
             "usage": _safe_usage(result.activation_cost, c_act),
-            "usage_unit": "server-expert activations",
+            "usage_unit": "activated expert memory",
             "unit_cost": c_act,
             "cost": int(result.activation_cost + 0.5),
         },
@@ -1128,6 +1214,12 @@ def _cost_breakdown(result: ChainedPipelineResult, cost_units: Mapping[str, floa
             "usage_unit": "forwarding events",
             "unit_cost": c_fwd,
             "cost": int(result.forwarding_cost + 0.5),
+        },
+        "inference": {
+            "usage": _safe_usage(result.inference_cost, c_inf),
+            "usage_unit": "expert inference cost units",
+            "unit_cost": c_inf,
+            "cost": int(result.inference_cost + 0.5),
         },
     }
 
@@ -1146,6 +1238,7 @@ def result_to_jsonable(
             "activation_cost": int(result.activation_cost + 0.5),
             "bandwidth_cost": int(result.bandwidth_cost + 0.5),
             "forwarding_cost": int(result.forwarding_cost + 0.5),
+            "inference_cost": int(result.inference_cost + 0.5),
         },
         "cost_breakdown": _cost_breakdown(result, cost_units),
         "expert_placement": result.expert_placement,
@@ -1281,6 +1374,7 @@ def run_chained_pipeline(
             "activation": c_act,
             "bandwidth": c_bw,
             "forwarding": c_fwd,
+            "inference": 1.0,
         },
         "hybrid_algorithm_parameters": {
             "top_k": top_k,
@@ -1299,7 +1393,7 @@ def run_chained_pipeline(
             "server_gpu_memory_range": server_gpu_memory_range,
             "wired_rate_range": wired_rate_range,
             "wired_extra_link_probability": wired_extra_link_probability,
-            "bandwidth_mode": "derived_by_group_slack",
+            "bandwidth_mode": "pdf_equivalent_bandwidth_demand_by_group_slack",
             "default_feature_bits": default_feature_bits,
             "feature_bits_range": feature_bits_range,
             "feature_bits_by_name": feature_bits_by_name,
@@ -1325,27 +1419,13 @@ def run_chained_pipeline(
             result_to_jsonable(
                 result,
                 network_context,
-                cost_units={"activation": c_act, "bandwidth": c_bw, "forwarding": c_fwd},
+                cost_units={"activation": c_act, "bandwidth": c_bw, "forwarding": c_fwd, "inference": 1.0},
             ),
             file,
             ensure_ascii=False,
             indent=2,
         )
     return result
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
