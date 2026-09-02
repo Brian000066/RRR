@@ -251,9 +251,20 @@ class ChainedComparisonPipeline:
                         selected.append((server_id, expert_id))
                         selected_experts.add(expert_id)
                         self._activate(server_id, expert_id, activated, used_memory)
+
+                '''
                 if not selected:
                     self.scheduler_violations.append(
                         f"TopK placement: no feasible expert on any single server for {key}"
+                    )
+                
+                上面是AI改的（將265~268行內容改成256~259行內容），他覺得「選 Top-K 個 expert 只是演算法策略，不是 System Model constraint」，所以就改成不強制選 K 個 expert，只要確保能至少選到一個 expert 就好。
+                但是我不同意他的說法，Top-K 這個比較方法本來就是要選 K 個 expert 才對，所以我就改回來了。
+                '''
+
+                if len(selected) < min(self.top_k, len(self.experts)):
+                    self.scheduler_violations.append(
+                        f"TopK placement: only {len(selected)} feasible experts for {key}; target {self.top_k}"
                     )
                 assignments[key] = selected
                 selected_experts_by_key[key] = selected_experts
@@ -268,11 +279,13 @@ class ChainedComparisonPipeline:
         used_memory,
     ):
         candidates = []
+        '''
         threshold = None
         try:
             threshold = self.evaluator.conformal_loss_threshold(subtask)
         except Exception:
             threshold = None
+        '''
 
         for server_id, server in self.servers.items():
 
@@ -312,6 +325,7 @@ class ChainedComparisonPipeline:
                 self._expert_score(subtask, expert_id)
                 for expert_id in feasible_experts
             )
+            '''
             pairs = tuple((server_id, expert_id) for expert_id in feasible_experts)
             probability = self.evaluator.selection_probability(subtask, set(feasible_experts))
             rec_loss = self._estimated_local_reconstruction_for_pairs(subtask, pairs)
@@ -328,10 +342,21 @@ class ChainedComparisonPipeline:
                     feasible_experts,
                 )
             )
+            '''
+
+            candidates.append(
+                (
+                    len(feasible_experts),
+                    score,
+                    server_id,
+                    feasible_experts,
+                )
+            )
 
         if not candidates:
             return None, []
 
+        '''
         # Prefer a server whose local feature/expert combination is already
         # closest to satisfying the PDF performance-loss constraint.
         candidates.sort(
@@ -340,8 +365,23 @@ class ChainedComparisonPipeline:
 
         _, _, _, _, server_id, expert_ids = candidates[0]
 
+        以上是AI原本改的，包含這個 function（_best_server_for_subtask）內的註解都是AI改（新加上）的。
+        他說不改會對於 Top-K 這個比較方法不利（差不多意思就是這樣）
+        但是我不同意他的說法，Top-K 這個比較方法本來就只會根據 expert 因素來選 expert ，不會牽扯到 feature 相關的因素，而且正是這樣才會拿這個比較方法來比，以突顯我們的方法的優勢，所以我就改回來了。
+        '''
+
+        # 優先：
+        # 1. 能提供較多 experts 的 server
+        # 2. expert suitability / gating score 較高
+        candidates.sort(
+            key=lambda x: (-x[0], -x[1], str(x[2]))
+        )
+
+        _, _, server_id, expert_ids = candidates[0]
+        
         return server_id, expert_ids
 
+    #未使用
     def _estimated_local_reconstruction_for_pairs(
         self,
         subtask: SubtaskSpec,

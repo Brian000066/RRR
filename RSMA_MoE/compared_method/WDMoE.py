@@ -213,8 +213,18 @@ class WDMoEExpertSelectionMixin:
                 activated=activated,
                 used_memory=used_memory,
             )
+
+            '''
             # This server cannot execute the subtask without any expert.
             if not baseline_experts:
+                continue
+            
+            以上3行是AI原本改的，他覺得「選 Top-K 個 expert 只是演算法策略，不是 System Model constraint」，所以就改成不強制選 K 個 expert，只要確保能至少選到一個 expert 就好。
+            但是我不同意他的說法，所以我就改回來了。
+            '''
+
+            # This server cannot provide enough experts
+            if len(baseline_experts) < self.top_k:
                 continue
 
             # 2. Calculate latency assuming the entire node
