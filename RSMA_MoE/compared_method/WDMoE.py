@@ -558,6 +558,8 @@ def _run_wdmoe_pipeline(
     num_experts: int,
     num_iot_features: int,
     expert_memory_range: tuple[float, float] | None = None,
+    expert_inference_times_ms: Sequence[float] | None = None,
+    expert_inference_costs: Sequence[float] | None = None,
     feature_bits_range: tuple[float, float] | None = None,
     top_k: int = 2,
     num_servers: int = 9,
@@ -570,6 +572,7 @@ def _run_wdmoe_pipeline(
     server_gpu_memory_range: tuple[float, float] | None = None,
     wired_rate_range: tuple[float, float] | None = None,
     wired_extra_link_probability: float = 0.05,
+    wired_edge_weight_range: tuple[float, float] = (1.0, 3.0),
     c_bw: float = 1e-3,
     c_act: float = 1.0,
     c_fwd: float = 1.0,
@@ -602,6 +605,8 @@ def _run_wdmoe_pipeline(
         num_experts=num_experts,
         num_iot_features=num_iot_features,
         expert_memory_range=expert_memory_range,
+        expert_inference_times_ms=expert_inference_times_ms,
+        expert_inference_costs=expert_inference_costs,
         feature_bits_range=feature_bits_range,
         num_servers=num_servers,
         num_iot_devices=num_iot_devices,
@@ -613,6 +618,7 @@ def _run_wdmoe_pipeline(
         server_gpu_memory_range=server_gpu_memory_range,
         wired_rate_range=wired_rate_range,
         wired_extra_link_probability=wired_extra_link_probability,
+        wired_edge_weight_range=wired_edge_weight_range,
         default_feature_bits=default_feature_bits,
         max_device_power=max_device_power,
         area_size=area_size,
@@ -698,6 +704,7 @@ def _run_wdmoe_pipeline(
             "server_gpu_memory_range": server_gpu_memory_range,
             "wired_rate_range": wired_rate_range,
             "wired_extra_link_probability": wired_extra_link_probability,
+            "wired_edge_weight_range": wired_edge_weight_range,
             "bandwidth_mode": "pdf_equivalent_bandwidth_demand_by_group_slack",
             "default_feature_bits": default_feature_bits,
             "feature_bits_range": feature_bits_range,
@@ -758,8 +765,6 @@ def run_wdmoe_gssgd(
         output_path,
         **kwargs,
     )
-
-
 
 
 

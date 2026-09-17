@@ -7,10 +7,13 @@ if str(BASE_DIR) not in sys.path:
 
 from config import ExperimentConfig 
 from experiment_runner import run_experiment
+from sensitivity_analysis import run_all_sweeps
 
 
 def main() -> None:
-    run_experiment(ExperimentConfig())
+    config = ExperimentConfig()
+    run_experiment(config)
+    run_all_sweeps(config.num_runs, base_config=config)
 
 
 if __name__ == "__main__":

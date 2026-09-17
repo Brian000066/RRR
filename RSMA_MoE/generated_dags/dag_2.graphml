@@ -1,130 +1,206 @@
 <?xml version='1.0' encoding='utf-8'?>
-<graphml xmlns="http://graphml.graphdrawing.org/xmlns" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://graphml.graphdrawing.org/xmlns http://graphml.graphdrawing.org/xmlns/1.0/graphml.xsd"><key id="d27" for="node" attr.name="branch_position" attr.type="long"/>
-<key id="d26" for="node" attr.name="branch_id" attr.type="long"/>
-<key id="d25" for="node" attr.name="calibration_losses" attr.type="string"/>
-<key id="d24" for="node" attr.name="reconstruction_loss" attr.type="double"/>
-<key id="d23" for="node" attr.name="reconstruction_errors" attr.type="string"/>
-<key id="d22" for="node" attr.name="expert_confidence" attr.type="string"/>
-<key id="d21" for="node" attr.name="gating_weights" attr.type="string"/>
-<key id="d20" for="node" attr.name="required_data" attr.type="string"/>
-<key id="d19" for="node" attr.name="output_key" attr.type="string"/>
-<key id="d18" for="node" attr.name="prompt" attr.type="string"/>
-<key id="d17" for="node" attr.name="layer" attr.type="long"/>
-<key id="d16" for="graph" attr.name="layer_widths" attr.type="string"/>
-<key id="d15" for="graph" attr.name="num_experts" attr.type="long"/>
-<key id="d14" for="graph" attr.name="deadline_seconds" attr.type="long"/>
-<key id="d13" for="graph" attr.name="task_name" attr.type="string"/>
-<key id="d12" for="graph" attr.name="task_id" attr.type="string"/>
-<key id="d11" for="graph" attr.name="single_sink" attr.type="boolean"/>
-<key id="d10" for="graph" attr.name="single_source" attr.type="boolean"/>
-<key id="d9" for="graph" attr.name="allow_early_branch_end" attr.type="boolean"/>
-<key id="d8" for="graph" attr.name="allow_skip_edges" attr.type="boolean"/>
-<key id="d7" for="graph" attr.name="edge_probability" attr.type="double"/>
-<key id="d6" for="graph" attr.name="max_width" attr.type="long"/>
-<key id="d5" for="graph" attr.name="depth" attr.type="long"/>
-<key id="d4" for="graph" attr.name="branch_lengths" attr.type="string"/>
-<key id="d3" for="graph" attr.name="num_branches" attr.type="long"/>
-<key id="d2" for="graph" attr.name="num_nodes" attr.type="long"/>
-<key id="d1" for="graph" attr.name="generation_mode" attr.type="string"/>
-<key id="d0" for="graph" attr.name="graph_index" attr.type="long"/>
-<graph edgedefault="directed"><data key="d0">2</data>
-<data key="d1">branches</data>
-<data key="d2">6</data>
-<data key="d3">2</data>
-<data key="d4">[1, 4]</data>
-<data key="d5">5</data>
-<data key="d6">2</data>
-<data key="d7">0.2</data>
-<data key="d8">False</data>
-<data key="d9">True</data>
-<data key="d10">True</data>
-<data key="d11">False</data>
-<data key="d12">task_2</data>
-<data key="d13">Task 2</data>
-<data key="d14">117</data>
-<data key="d15">16</data>
-<data key="d16">[1, 2, 1, 1, 1]</data>
-<node id="v2_0">
-  <data key="d17">0</data>
-  <data key="d18">Complete subtask v2_0 in layer 0.</data>
-  <data key="d19">v2_0_output</data>
-  <data key="d20">{"upstream_outputs": [], "iot_features": [29, 58, 82]}</data>
-  <data key="d21">[0.00586, 0.009262, 0.021774, 0.020538, 0.233536, 0.018364, 0.024661, 0.005015, 0.010457, 0.01487, 0.194527, 0.015563, 0.168356, 0.011023, 0.012132, 0.234062]</data>
-  <data key="d22">[0.299263, 0.245568, 0.595605, 0.633097, 0.911572, 0.635715, 0.585534, 0.226547, 0.121272, 0.180329, 0.967998, 0.18644, 0.90376, 0.141707, 0.264508, 0.927896]</data>
-  <data key="d23">[1.002252, 1.002252, 1.002252]</data>
-  <data key="d24">1.506764</data>
-  <data key="d25">[3.135371, 2.187527, 2.947968, 2.711427, 1.856136, 1.71001, 2.753688, 2.673309, 1.754367, 2.661399, 1.905867, 1.942897, 2.771469, 2.052937, 2.970539, 1.5355, 2.443415, 3.297521, 2.474004, 2.567931]</data>
-  <data key="d26">-1</data>
-  <data key="d27">0</data>
-</node>
-<node id="v2_1">
-  <data key="d17">1</data>
-  <data key="d18">Complete subtask v2_1 in layer 1.</data>
-  <data key="d19">v2_1_output</data>
-  <data key="d20">{"upstream_outputs": [{"source_node": "v2_0", "output_key": "v2_0_output"}], "iot_features": [22, 26, 51, 57, 58]}</data>
-  <data key="d21">[0.007885, 0.005208, 0.011584, 0.006883, 0.260336, 0.026301, 0.025877, 0.271907, 0.026489, 0.011102, 0.021893, 0.008628, 0.021063, 0.243863, 0.026882, 0.024099]</data>
-  <data key="d22">[0.142625, 0.106146, 0.239057, 0.190607, 0.965887, 0.620948, 0.542619, 0.923652, 0.571284, 0.384003, 0.106136, 0.262253, 0.380285, 0.853177, 0.950793, 0.661557]</data>
-  <data key="d23">[1.061459, 1.061459, 1.061459, 1.061459, 1.061459]</data>
-  <data key="d24">2.816738</data>
-  <data key="d25">[1.724837, 2.087951, 2.501003, 1.818326, 2.062804, 2.753754, 2.153672, 1.909557, 2.213832, 2.073401, 1.842157, 1.616973, 2.046036, 3.297451, 3.153727, 2.683505, 1.817684, 2.348009, 2.99218, 2.818378]</data>
-  <data key="d26">0</data>
-  <data key="d27">1</data>
-</node>
-<node id="v2_2">
-  <data key="d17">1</data>
-  <data key="d18">Complete subtask v2_2 in layer 1.</data>
-  <data key="d19">v2_2_output</data>
-  <data key="d20">{"upstream_outputs": [{"source_node": "v2_0", "output_key": "v2_0_output"}], "iot_features": [33, 76, 84, 98]}</data>
-  <data key="d21">[0.01251, 0.25432, 0.314708, 0.02181, 0.01345, 0.008418, 0.022275, 0.019852, 0.026699, 0.009257, 0.01525, 0.014974, 0.013975, 0.226744, 0.019386, 0.006372]</data>
-  <data key="d22">[0.355515, 0.897768, 0.949956, 0.528937, 0.175163, 0.106047, 0.521214, 0.535199, 0.87893, 0.185644, 0.248836, 0.166804, 0.213634, 0.948856, 0.588242, 0.156875]</data>
-  <data key="d23">[1.219282, 1.219282, 1.219282, 1.219282]</data>
-  <data key="d24">2.973297</data>
-  <data key="d25">[1.804804, 2.881169, 3.24911, 3.075234, 2.658129, 1.879347, 2.464037, 1.983486, 2.725252, 1.735648, 1.811193, 2.246769, 2.999112, 1.570058, 2.800503, 2.080807, 1.682667, 2.913199, 1.599215, 2.066834]</data>
-  <data key="d26">1</data>
-  <data key="d27">1</data>
-</node>
-<node id="v2_3">
-  <data key="d17">2</data>
-  <data key="d18">Complete subtask v2_3 in layer 2.</data>
-  <data key="d19">v2_3_output</data>
-  <data key="d20">{"upstream_outputs": [{"source_node": "v2_2", "output_key": "v2_2_output"}], "iot_features": [36, 37]}</data>
-  <data key="d21">[0.01415, 0.013626, 0.005361, 0.00915, 0.007784, 0.014604, 0.011948, 0.314663, 0.013117, 0.259582, 0.009918, 0.270746, 0.009689, 0.016324, 0.015817, 0.013521]</data>
-  <data key="d22">[0.507039, 0.656011, 0.347145, 0.255508, 0.105005, 0.510558, 0.20567, 0.938584, 0.269095, 0.909476, 0.395178, 0.894583, 0.371568, 0.964003, 0.544331, 0.268135]</data>
-  <data key="d23">[1.481788, 1.481788]</data>
-  <data key="d24">2.195696</data>
-  <data key="d25">[2.990233, 2.192875, 3.194801, 3.186761, 2.723185, 2.72533, 2.367331, 1.944591, 2.636394, 1.548793, 1.89403, 2.132881, 1.968008, 1.780215, 2.669441, 3.048265, 1.724511, 2.021653, 2.932915, 2.125988]</data>
-  <data key="d26">1</data>
-  <data key="d27">2</data>
-</node>
-<node id="v2_4">
-  <data key="d17">3</data>
-  <data key="d18">Complete subtask v2_4 in layer 3.</data>
-  <data key="d19">v2_4_output</data>
-  <data key="d20">{"upstream_outputs": [{"source_node": "v2_3", "output_key": "v2_3_output"}], "iot_features": [17, 27, 56, 91]}</data>
-  <data key="d21">[0.031365, 0.024579, 0.019757, 0.023437, 0.233435, 0.01776, 0.029445, 0.018128, 0.021787, 0.236739, 0.006333, 0.041637, 0.24667, 0.020302, 0.01838, 0.010246]</data>
-  <data key="d22">[0.574272, 0.535033, 0.35517, 0.520824, 0.916695, 0.241387, 0.622318, 0.23367, 0.296546, 0.907889, 0.160584, 0.864423, 0.878633, 0.151419, 0.243915, 0.269195]</data>
-  <data key="d23">[1.493354, 1.493354, 1.493354, 1.493354]</data>
-  <data key="d24">4.460212</data>
-  <data key="d25">[1.505219, 3.238664, 1.98317, 2.372693, 2.637483, 3.113567, 2.396493, 1.651562, 2.251124, 2.644122, 2.145184, 2.7698, 3.090488, 2.207824, 2.699725, 2.249256, 2.525442, 2.052372, 2.437131, 2.221366]</data>
-  <data key="d26">1</data>
-  <data key="d27">3</data>
-</node>
-<node id="v2_5">
-  <data key="d17">4</data>
-  <data key="d18">Complete subtask v2_5 in layer 4.</data>
-  <data key="d19">v2_5_output</data>
-  <data key="d20">{"upstream_outputs": [{"source_node": "v2_4", "output_key": "v2_4_output"}], "iot_features": [32, 48, 57, 72, 78]}</data>
-  <data key="d21">[0.022906, 0.036773, 0.248536, 0.237731, 0.013642, 0.026363, 0.011668, 0.007887, 0.028719, 0.018244, 0.034678, 0.019908, 0.020965, 0.009392, 0.229734, 0.032854]</data>
-  <data key="d22">[0.182832, 0.883234, 0.869342, 0.879825, 0.315509, 0.480337, 0.256987, 0.323308, 0.554333, 0.234772, 0.589895, 0.103642, 0.176738, 0.132496, 0.901741, 0.598973]</data>
-  <data key="d23">[1.358726, 1.358726, 1.358726, 1.358726, 1.358726]</data>
-  <data key="d24">4.615341</data>
-  <data key="d25">[1.922819, 1.900221, 2.471288, 2.488901, 2.574254, 3.143069, 2.300254, 2.347891, 2.846182, 2.503732, 2.58266, 3.270524, 2.789583, 2.271069, 1.537099, 1.790454, 1.823578, 3.110831, 3.163844, 3.129003]</data>
-  <data key="d26">1</data>
-  <data key="d27">4</data>
-</node>
-<edge source="v2_0" target="v2_1"/>
-<edge source="v2_0" target="v2_2"/>
-<edge source="v2_2" target="v2_3"/>
-<edge source="v2_3" target="v2_4"/>
-<edge source="v2_4" target="v2_5"/>
-</graph></graphml>
+<graphml xmlns="http://graphml.graphdrawing.org/xmlns" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://graphml.graphdrawing.org/xmlns http://graphml.graphdrawing.org/xmlns/1.0/graphml.xsd">
+  <key id="d28" for="node" attr.name="unique_subtask_id" attr.type="string" />
+  <key id="d27" for="node" attr.name="branch_position" attr.type="long" />
+  <key id="d26" for="node" attr.name="branch_id" attr.type="long" />
+  <key id="d25" for="node" attr.name="calibration_losses" attr.type="string" />
+  <key id="d24" for="node" attr.name="reconstruction_loss" attr.type="double" />
+  <key id="d23" for="node" attr.name="reconstruction_errors" attr.type="string" />
+  <key id="d22" for="node" attr.name="expert_confidence" attr.type="string" />
+  <key id="d21" for="node" attr.name="gating_weights" attr.type="string" />
+  <key id="d20" for="node" attr.name="required_data" attr.type="string" />
+  <key id="d19" for="node" attr.name="output_key" attr.type="string" />
+  <key id="d18" for="node" attr.name="prompt" attr.type="string" />
+  <key id="d17" for="node" attr.name="layer" attr.type="long" />
+  <key id="d16" for="graph" attr.name="layer_widths" attr.type="string" />
+  <key id="d15" for="graph" attr.name="num_experts" attr.type="long" />
+  <key id="d14" for="graph" attr.name="deadline_seconds" attr.type="long" />
+  <key id="d13" for="graph" attr.name="task_name" attr.type="string" />
+  <key id="d12" for="graph" attr.name="task_id" attr.type="string" />
+  <key id="d11" for="graph" attr.name="single_sink" attr.type="boolean" />
+  <key id="d10" for="graph" attr.name="single_source" attr.type="boolean" />
+  <key id="d9" for="graph" attr.name="allow_early_branch_end" attr.type="boolean" />
+  <key id="d8" for="graph" attr.name="allow_skip_edges" attr.type="boolean" />
+  <key id="d7" for="graph" attr.name="edge_probability" attr.type="double" />
+  <key id="d6" for="graph" attr.name="max_width" attr.type="long" />
+  <key id="d5" for="graph" attr.name="depth" attr.type="long" />
+  <key id="d4" for="graph" attr.name="branch_lengths" attr.type="string" />
+  <key id="d3" for="graph" attr.name="num_branches" attr.type="long" />
+  <key id="d2" for="graph" attr.name="num_nodes" attr.type="long" />
+  <key id="d1" for="graph" attr.name="generation_mode" attr.type="string" />
+  <key id="d0" for="graph" attr.name="graph_index" attr.type="long" />
+  <graph edgedefault="directed">
+    <node id="v2_0">
+      <data key="d17">0</data>
+      <data key="d18">Complete subtask v2_0 in layer 0.</data>
+      <data key="d19">v2_0_output</data>
+      <data key="d20">{"upstream_outputs": [], "iot_features": [2, 13, 34, 50]}</data>
+      <data key="d21">[0.137793, 0.166461, 0.124969, 0.176554, 0.037313, 0.172576, 0.125899, 0.058435]</data>
+      <data key="d22">[0.938788, 0.908487, 0.512042, 0.958157, 0.6783, 0.87981, 0.605797, 0.599138]</data>
+      <data key="d23">[1.358919, 1.358919, 1.358919, 1.358919]</data>
+      <data key="d24">3.693322</data>
+      <data key="d25">[2.8988, 1.962306, 2.085873, 2.851637, 2.93148, 1.939957, 2.156739, 2.073721, 3.098664, 1.975601, 2.197967, 2.645879, 1.517843, 2.329552, 2.137824, 2.292726, 2.521777, 2.231817, 2.163937, 2.652123]</data>
+      <data key="d26">-1</data>
+      <data key="d27">0</data>
+      <data key="d28">subtask_0</data>
+    </node>
+    <node id="v2_1">
+      <data key="d17">1</data>
+      <data key="d18">Complete subtask v2_1 in layer 1.</data>
+      <data key="d19">v2_1_output</data>
+      <data key="d20">{"upstream_outputs": [{"source_node": "v2_0", "output_key": "v2_0_output"}], "iot_features": [30, 41, 57, 72, 90]}</data>
+      <data key="d21">[0.096366, 0.063686, 0.177382, 0.08214, 0.195658, 0.1754, 0.145761, 0.063607]</data>
+      <data key="d22">[0.540515, 0.645488, 0.871651, 0.666631, 0.966944, 0.856394, 0.86715, 0.55289]</data>
+      <data key="d23">[1.162456, 1.162456, 1.162456, 1.162456, 1.162456]</data>
+      <data key="d24">3.37826</data>
+      <data key="d25">[1.842925, 3.113918, 2.932163, 2.617416, 2.561999, 3.264073, 1.810858, 2.235827, 2.120629, 1.62568, 3.274831, 1.591689, 2.602878, 1.624564, 1.742355, 1.835531, 3.174748, 2.268222, 3.071301, 2.137427]</data>
+      <data key="d26">0</data>
+      <data key="d27">1</data>
+      <data key="d28">subtask_1</data>
+    </node>
+    <node id="v2_2">
+      <data key="d17">1</data>
+      <data key="d18">Complete subtask v2_2 in layer 1.</data>
+      <data key="d19">v2_2_output</data>
+      <data key="d20">{"upstream_outputs": [{"source_node": "v2_0", "output_key": "v2_0_output"}], "iot_features": [0, 20, 87]}</data>
+      <data key="d21">[0.190109, 0.144346, 0.17323, 0.032497, 0.185428, 0.087373, 0.07399, 0.113027]</data>
+      <data key="d22">[0.860316, 0.864296, 0.909793, 0.597033, 0.916149, 0.650503, 0.51404, 0.670618]</data>
+      <data key="d23">[1.316494, 1.316494, 1.316494]</data>
+      <data key="d24">2.599735</data>
+      <data key="d25">[2.792241, 3.119239, 2.317014, 2.774431, 1.953941, 2.250925, 2.68314, 2.40004, 1.892509, 2.319616, 2.613556, 3.272867, 3.102665, 1.833047, 2.829364, 2.261869, 2.59277, 3.237025, 2.856226, 2.755023]</data>
+      <data key="d26">1</data>
+      <data key="d27">1</data>
+      <data key="d28">subtask_2</data>
+    </node>
+    <node id="v2_3">
+      <data key="d17">2</data>
+      <data key="d18">Complete subtask v2_3 in layer 2.</data>
+      <data key="d19">v2_3_output</data>
+      <data key="d20">{"upstream_outputs": [{"source_node": "v2_1", "output_key": "v2_1_output"}, {"source_node": "v2_2", "output_key": "v2_2_output"}], "iot_features": [1, 2, 29, 53, 62]}</data>
+      <data key="d21">[0.025786, 0.05949, 0.236357, 0.046764, 0.237005, 0.033151, 0.276344, 0.085103]</data>
+      <data key="d22">[0.63805, 0.658184, 0.901532, 0.673453, 0.918503, 0.672283, 0.965379, 0.860822]</data>
+      <data key="d23">[1.290707, 1.290707, 1.290707, 1.290707, 1.290707]</data>
+      <data key="d24">4.164811</data>
+      <data key="d25">[1.681449, 1.903989, 2.744374, 3.00143, 2.013116, 2.224183, 3.046505, 2.566122, 2.287257, 1.978746, 1.646055, 1.826331, 1.986207, 1.555738, 2.704371, 2.555429, 1.798197, 2.867238, 3.12757, 2.39408]</data>
+      <data key="d26">1</data>
+      <data key="d27">2</data>
+      <data key="d28">subtask_3</data>
+    </node>
+    <node id="v2_4">
+      <data key="d17">3</data>
+      <data key="d18">Complete subtask v2_4 in layer 3.</data>
+      <data key="d19">v2_4_output</data>
+      <data key="d20">{"upstream_outputs": [{"source_node": "v2_3", "output_key": "v2_3_output"}], "iot_features": [9, 33, 50, 89]}</data>
+      <data key="d21">[0.147897, 0.028201, 0.16665, 0.190585, 0.110875, 0.051264, 0.152844, 0.151684]</data>
+      <data key="d22">[0.621718, 0.579963, 0.913253, 0.958699, 0.533854, 0.588624, 0.947882, 0.882765]</data>
+      <data key="d23">[1.258038, 1.258038, 1.258038, 1.258038]</data>
+      <data key="d24">3.165319</data>
+      <data key="d25">[3.153388, 1.720445, 1.554664, 2.895996, 1.637066, 2.453369, 2.946022, 1.532381, 2.735965, 3.210251, 2.210368, 2.062053, 2.71323, 2.078278, 2.936225, 2.429739, 2.660653, 3.13308, 2.338609, 2.010434]</data>
+      <data key="d26">1</data>
+      <data key="d27">3</data>
+      <data key="d28">subtask_4</data>
+    </node>
+    <node id="v2_5">
+      <data key="d17">1</data>
+      <data key="d18">Complete subtask v2_5 in layer 1.</data>
+      <data key="d19">v2_5_output</data>
+      <data key="d20">{"upstream_outputs": [{"source_node": "v2_0", "output_key": "v2_0_output"}], "iot_features": [25, 33, 40, 59, 88]}</data>
+      <data key="d21">[0.049245, 0.016377, 0.056151, 0.202542, 0.069992, 0.054364, 0.282678, 0.268651]</data>
+      <data key="d22">[0.468384, 0.48927, 0.582311, 0.879168, 0.952935, 0.485819, 0.964226, 0.974991]</data>
+      <data key="d23">[1.11713, 1.11713, 1.11713, 1.11713, 1.11713]</data>
+      <data key="d24">3.119949</data>
+      <data key="d25">[1.927176, 3.259576, 3.297003, 2.073683, 2.58168, 3.081271, 2.26111, 2.357633, 2.235167, 2.949942, 2.75048, 1.704633, 2.695966, 2.103803, 1.746375, 3.186173, 2.309106, 2.408077, 1.883829, 2.923759]</data>
+      <data key="d26">2</data>
+      <data key="d27">1</data>
+      <data key="d28">subtask_5</data>
+    </node>
+    <node id="v2_6">
+      <data key="d17">2</data>
+      <data key="d18">Complete subtask v2_6 in layer 2.</data>
+      <data key="d19">v2_6_output</data>
+      <data key="d20">{"upstream_outputs": [{"source_node": "v2_1", "output_key": "v2_1_output"}, {"source_node": "v2_5", "output_key": "v2_5_output"}], "iot_features": [12, 44, 58, 68]}</data>
+      <data key="d21">[0.347527, 0.013239, 0.074652, 0.037933, 0.042846, 0.062453, 0.056977, 0.364373]</data>
+      <data key="d22">[0.909819, 0.629017, 0.883731, 0.489228, 0.65411, 0.870794, 0.544295, 0.855419]</data>
+      <data key="d23">[1.035914, 1.035914, 1.035914, 1.035914]</data>
+      <data key="d24">2.146236</data>
+      <data key="d25">[2.10925, 1.528398, 2.495071, 2.89515, 2.580001, 2.499353, 2.637554, 2.864041, 3.136314, 1.690126, 2.189958, 1.936789, 3.160981, 2.32953, 2.58498, 1.983205, 2.413233, 2.155424, 1.810195, 2.949923]</data>
+      <data key="d26">2</data>
+      <data key="d27">2</data>
+      <data key="d28">subtask_6</data>
+    </node>
+    <node id="v2_7">
+      <data key="d17">3</data>
+      <data key="d18">Complete subtask v2_7 in layer 3.</data>
+      <data key="d19">v2_7_output</data>
+      <data key="d20">{"upstream_outputs": [{"source_node": "v2_1", "output_key": "v2_1_output"}, {"source_node": "v2_2", "output_key": "v2_2_output"}, {"source_node": "v2_6", "output_key": "v2_6_output"}, {"source_node": "v2_8", "output_key": "v2_8_output"}], "iot_features": [28, 55, 74, 85, 87]}</data>
+      <data key="d21">[0.03586, 0.028964, 0.226766, 0.184679, 0.050815, 0.038464, 0.213366, 0.221086]</data>
+      <data key="d22">[0.509358, 0.466117, 0.923817, 0.889674, 0.51175, 0.69228, 0.899271, 0.87638]</data>
+      <data key="d23">[0.916359, 0.916359, 0.916359, 0.916359, 0.916359]</data>
+      <data key="d24">2.099285</data>
+      <data key="d25">[3.07352, 2.230918, 1.962395, 2.933588, 3.257471, 1.892921, 3.184703, 2.98286, 2.518226, 1.710359, 3.250729, 2.269431, 3.226815, 1.962568, 1.870851, 1.739023, 1.697677, 2.407534, 1.572922, 2.037776]</data>
+      <data key="d26">2</data>
+      <data key="d27">3</data>
+      <data key="d28">subtask_7</data>
+    </node>
+    <node id="v2_8">
+      <data key="d17">1</data>
+      <data key="d18">Complete subtask v2_8 in layer 1.</data>
+      <data key="d19">v2_8_output</data>
+      <data key="d20">{"upstream_outputs": [{"source_node": "v2_0", "output_key": "v2_0_output"}], "iot_features": [11, 18, 20, 90]}</data>
+      <data key="d21">[0.177271, 0.075437, 0.063166, 0.172005, 0.100759, 0.078022, 0.164518, 0.168822]</data>
+      <data key="d22">[0.966566, 0.627464, 0.591452, 0.928401, 0.538535, 0.46043, 0.956572, 0.8999]</data>
+      <data key="d23">[1.015552, 1.015552, 1.015552, 1.015552]</data>
+      <data key="d24">2.062692</data>
+      <data key="d25">[2.449726, 1.659928, 2.858308, 3.18918, 3.019734, 1.551079, 2.681857, 1.982069, 2.931895, 1.502334, 2.632658, 2.362962, 1.845331, 2.112065, 2.103342, 2.410108, 2.826927, 3.247922, 2.518813, 3.260575]</data>
+      <data key="d26">3</data>
+      <data key="d27">1</data>
+      <data key="d28">subtask_8</data>
+    </node>
+    <node id="v2_9">
+      <data key="d17">2</data>
+      <data key="d18">Complete subtask v2_9 in layer 2.</data>
+      <data key="d19">v2_9_output</data>
+      <data key="d20">{"upstream_outputs": [{"source_node": "v2_5", "output_key": "v2_5_output"}, {"source_node": "v2_8", "output_key": "v2_8_output"}], "iot_features": [20, 60, 77, 80]}</data>
+      <data key="d21">[0.047355, 0.026923, 0.010536, 0.04895, 0.321829, 0.24662, 0.039163, 0.258624]</data>
+      <data key="d22">[0.691566, 0.661183, 0.530103, 0.906987, 0.906218, 0.88761, 0.524487, 0.977838]</data>
+      <data key="d23">[1.364352, 1.364352, 1.364352, 1.364352]</data>
+      <data key="d24">3.722913</data>
+      <data key="d25">[2.164011, 3.1936, 2.257107, 2.381771, 3.04016, 2.770644, 1.708122, 2.649581, 2.165808, 3.148596, 3.045931, 2.251556, 1.662974, 2.033497, 2.485102, 2.859681, 2.464822, 2.561011, 2.991729, 2.375468]</data>
+      <data key="d26">3</data>
+      <data key="d27">2</data>
+      <data key="d28">subtask_9</data>
+    </node>
+    <edge source="v2_0" target="v2_1" />
+    <edge source="v2_0" target="v2_2" />
+    <edge source="v2_0" target="v2_5" />
+    <edge source="v2_0" target="v2_8" />
+    <edge source="v2_1" target="v2_3" />
+    <edge source="v2_1" target="v2_6" />
+    <edge source="v2_1" target="v2_7" />
+    <edge source="v2_2" target="v2_3" />
+    <edge source="v2_2" target="v2_7" />
+    <edge source="v2_3" target="v2_4" />
+    <edge source="v2_5" target="v2_6" />
+    <edge source="v2_5" target="v2_9" />
+    <edge source="v2_6" target="v2_7" />
+    <edge source="v2_8" target="v2_9" />
+    <edge source="v2_8" target="v2_7" />
+    <data key="d0">2</data>
+    <data key="d1">branches</data>
+    <data key="d2">10</data>
+    <data key="d3">4</data>
+    <data key="d4">[1, 3, 3, 2]</data>
+    <data key="d5">4</data>
+    <data key="d6">4</data>
+    <data key="d7">0.2</data>
+    <data key="d8">False</data>
+    <data key="d9">True</data>
+    <data key="d10">True</data>
+    <data key="d11">False</data>
+    <data key="d12">task_2</data>
+    <data key="d13">Task 2</data>
+    <data key="d14">111</data>
+    <data key="d15">8</data>
+    <data key="d16">[1, 4, 3, 2]</data>
+  </graph>
+</graphml>

@@ -236,6 +236,8 @@ def normalize_float_range(
 def build_simple_experts(
     num_experts: int,
     memory_range: tuple[float, float] | None = None,
+    inference_times_ms: Sequence[float] | None = None,
+    inference_costs: Sequence[float] | None = None,
     rng: random.Random | None = None,
 ) -> dict[str, dict[str, float | int]]:
     """Create indexed experts with heterogeneous model sizes."""
@@ -244,6 +246,14 @@ def build_simple_experts(
 
     rng = rng or random.Random()
     memory_min, memory_max = normalize_float_range(memory_range, (256.0, 256.0), "expert_memory_range")
+    if inference_times_ms is not None and len(inference_times_ms) != num_experts:
+        raise ValueError("expert_inference_times_ms length must match num_experts.")
+    if inference_costs is not None and len(inference_costs) != num_experts:
+        raise ValueError("expert_inference_costs length must match num_experts.")
+    if inference_times_ms is not None and any(value <= 0.0 for value in inference_times_ms):
+        raise ValueError("expert_inference_times_ms values must be positive.")
+    if inference_costs is not None and any(value < 0.0 for value in inference_costs):
+        raise ValueError("expert_inference_costs values cannot be negative.")
 
     experts: dict[str, dict[str, float | int]] = {}
     for index in range(num_experts):
@@ -251,8 +261,16 @@ def build_simple_experts(
         experts[expert_id(index)] = {
             "index": index,
             "memory": memory,
-            "latency": 0.05 + index * 0.01,
-            "inference_cost": memory * 0.01,
+            "latency": (
+                float(inference_times_ms[index]) / 1000.0
+                if inference_times_ms is not None
+                else 0.05 + index * 0.01
+            ),
+            "inference_cost": (
+                float(inference_costs[index])
+                if inference_costs is not None
+                else memory * 0.01
+            ),
         }
     return experts
 
@@ -264,24 +282,34 @@ def build_physical_wired_shortest_paths(
     rate_max: float,
     rng: random.Random,
     extra_link_probability: float = 0.25,
+    edge_weight_range: tuple[float, float] = (1.0, 3.0),
 ) -> tuple[dict[int, dict[int, float]], dict[int, dict[int, float]], list[dict[str, Any]]]:
-    """Build a connected physical MEC graph and derive shortest-route rates.
+    """Build a connected physical MEC graph and derive minimum-cost routes.
 
     The logical wired connection between any two servers follows the
-    predetermined shortest physical route. The route weight is its hop count,
-    and the effective end-to-end rate is the bottleneck rate along that route.
+    physical route with the smallest sum of edge weights. The effective
+    end-to-end rate is the bottleneck rate along that selected route.
     """
     if num_servers < 1:
         return {}, {}, []
 
-    links: dict[tuple[int, int], float] = {}
+    weight_min, weight_max = edge_weight_range
+    if weight_min <= 0.0 or weight_max <= 0.0:
+        raise ValueError("wired edge weights must be positive.")
+    if weight_min > weight_max:
+        weight_min, weight_max = weight_max, weight_min
+
+    links: dict[tuple[int, int], tuple[float, float]] = {}
 
     def add_link(left: int, right: int) -> None:
         if left == right:
             return
         key = (min(left, right), max(left, right))
         if key not in links:
-            links[key] = rng.uniform(rate_min, rate_max)
+            links[key] = (
+                rng.uniform(rate_min, rate_max),
+                rng.uniform(weight_min, weight_max),
+            )
 
     if num_servers == 1:
         return {0: {}}, {0: {}}, []
@@ -296,31 +324,48 @@ def build_physical_wired_shortest_paths(
             if rng.random() < extra_link_probability:
                 add_link(left, right)
 
+    route_cost = [[math.inf for _ in range(num_servers)] for _ in range(num_servers)]
     hops = [[math.inf for _ in range(num_servers)] for _ in range(num_servers)]
     bottleneck = [[0.0 for _ in range(num_servers)] for _ in range(num_servers)]
     for index in range(num_servers):
+        route_cost[index][index] = 0.0
         hops[index][index] = 0
         bottleneck[index][index] = math.inf
-    for (left, right), rate in links.items():
+    for (left, right), (rate, edge_weight) in links.items():
+        route_cost[left][right] = route_cost[right][left] = edge_weight
         hops[left][right] = hops[right][left] = 1
         bottleneck[left][right] = bottleneck[right][left] = rate
 
     for mid in range(num_servers):
         for src in range(num_servers):
-            if hops[src][mid] == math.inf:
+            if route_cost[src][mid] == math.inf:
                 continue
             for dst in range(num_servers):
-                if hops[mid][dst] == math.inf:
+                if route_cost[mid][dst] == math.inf:
                     continue
+                candidate_cost = route_cost[src][mid] + route_cost[mid][dst]
                 candidate_hops = hops[src][mid] + hops[mid][dst]
                 candidate_rate = min(bottleneck[src][mid], bottleneck[mid][dst])
+                cost_tied = math.isclose(
+                    candidate_cost,
+                    route_cost[src][dst],
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
                 if (
-                    candidate_hops < hops[src][dst]
+                    candidate_cost < route_cost[src][dst] - 1e-12
                     or (
-                        candidate_hops == hops[src][dst]
-                        and candidate_rate > bottleneck[src][dst]
+                        cost_tied
+                        and (
+                            candidate_rate > bottleneck[src][dst]
+                            or (
+                                math.isclose(candidate_rate, bottleneck[src][dst])
+                                and candidate_hops < hops[src][dst]
+                            )
+                        )
                     )
                 ):
+                    route_cost[src][dst] = candidate_cost
                     hops[src][dst] = candidate_hops
                     bottleneck[src][dst] = candidate_rate
 
@@ -331,11 +376,20 @@ def build_physical_wired_shortest_paths(
             if src == dst:
                 continue
             wired_rates[src][dst] = bottleneck[src][dst] if bottleneck[src][dst] > 0.0 else rate_min
-            wired_weights[src][dst] = float(hops[src][dst] if hops[src][dst] != math.inf else num_servers)
+            wired_weights[src][dst] = float(
+                route_cost[src][dst]
+                if route_cost[src][dst] != math.inf
+                else num_servers * weight_max
+            )
 
     link_list = [
-        {"src": f"server_{left}", "dst": f"server_{right}", "rate": rate}
-        for (left, right), rate in sorted(links.items())
+        {
+            "src": f"server_{left}",
+            "dst": f"server_{right}",
+            "rate": rate,
+            "weight": edge_weight,
+        }
+        for (left, right), (rate, edge_weight) in sorted(links.items())
     ]
     return wired_rates, wired_weights, link_list
 
@@ -347,6 +401,7 @@ def build_simple_servers(
     gpu_memory_range: tuple[float, float] | None = None,
     wired_rate_range: tuple[float, float] | None = None,
     wired_extra_link_probability: float = 0.05,
+    wired_edge_weight_range: tuple[float, float] = (1.0, 3.0),
     rng: random.Random | None = None,
 ) -> list[dict[str, Any]]:
     """Create edge servers with balanced expert replicas and random wired links."""
@@ -416,6 +471,7 @@ def build_simple_servers(
         rate_max,
         rng,
         extra_link_probability=wired_extra_link_probability,
+        edge_weight_range=wired_edge_weight_range,
     )
 
     servers: list[dict[str, Any]] = []
@@ -812,6 +868,8 @@ def build_scheduler_inputs(
     num_experts: int,
     num_iot_features: int,
     expert_memory_range: tuple[float, float] | None = None,
+    expert_inference_times_ms: Sequence[float] | None = None,
+    expert_inference_costs: Sequence[float] | None = None,
     feature_bits_range: tuple[float, float] | None = None,
     num_servers: int = 9,
     num_iot_devices: int = 100,
@@ -823,6 +881,7 @@ def build_scheduler_inputs(
     server_gpu_memory_range: tuple[float, float] | None = None,
     wired_rate_range: tuple[float, float] | None = None,
     wired_extra_link_probability: float = 0.05,
+    wired_edge_weight_range: tuple[float, float] = (1.0, 3.0),
     default_feature_bits: float = 12000.0,
     max_device_power: float = 1.2589e-3,
     area_size: float = 1000.0,
@@ -835,7 +894,13 @@ def build_scheduler_inputs(
     rng = random.Random(random_seed)
     tasks = graphs_to_tasks(graphs, loss_threshold)
     feature_bits_by_name = build_feature_bits(num_iot_features, default_feature_bits, feature_bits_range, rng)
-    experts = build_simple_experts(num_experts, memory_range=expert_memory_range, rng=rng)
+    experts = build_simple_experts(
+        num_experts,
+        memory_range=expert_memory_range,
+        inference_times_ms=expert_inference_times_ms,
+        inference_costs=expert_inference_costs,
+        rng=rng,
+    )
     servers = build_simple_servers(
         num_servers=num_servers,
         experts=experts,
@@ -844,6 +909,7 @@ def build_scheduler_inputs(
         gpu_memory_range=server_gpu_memory_range,
         wired_rate_range=wired_rate_range,
         wired_extra_link_probability=wired_extra_link_probability,
+        wired_edge_weight_range=wired_edge_weight_range,
         rng=rng,
     )
     devices, topology = build_simple_devices(

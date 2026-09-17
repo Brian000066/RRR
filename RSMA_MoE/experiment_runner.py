@@ -35,6 +35,7 @@ class AverageResult:
     activation_usage: float = 0.0
     bandwidth_usage: float = 0.0
     forwarding_usage: float = 0.0
+    inference_time_ms: float = 0.0
     avg_servers_per_subtask: float = 0.0
     avg_experts_per_subtask: float = 0.0
     violations: tuple[Any, ...] = ()
@@ -94,6 +95,8 @@ def common_scheduler_kwargs(config: ExperimentConfig, seeds: RunSeeds) -> dict[s
     return {
         "num_experts": config.num_experts,
         "expert_memory_range": config.expert_memory_range,
+        "expert_inference_times_ms": config.expert_inference_times_ms,
+        "expert_inference_costs": config.expert_inference_costs,
         "num_iot_features": config.num_iot_features,
         "num_servers": config.num_edge_servers,
         "num_iot_devices": config.num_iot_devices,
@@ -104,6 +107,7 @@ def common_scheduler_kwargs(config: ExperimentConfig, seeds: RunSeeds) -> dict[s
         "server_gpu_memory_range": config.server_gpu_memory_range,
         "wired_rate_range": config.wired_rate_range,
         "wired_extra_link_probability": config.wired_extra_link_probability,
+        "wired_edge_weight_range": config.wired_edge_weight_range,
         "c_bw": config.c_bw,
         "c_act": config.c_act,
         "c_fwd": config.c_fwd,
@@ -238,10 +242,20 @@ def result_diagnostics(result: Any, config: ExperimentConfig) -> dict[str, float
         server_counts.append(len({server_id for server_id, _ in pairs}))
         expert_counts.append(len(pairs))
 
+    evaluation = getattr(result, "evaluation", None)
+    timing = getattr(evaluation, "timing", None)
+    start_times = getattr(timing, "subtask_start_time", {}) or {}
+    finish_times = getattr(timing, "subtask_finish_time", {}) or {}
+    inference_time_ms = 1000.0 * sum(
+        max(0.0, finish_time - start_times.get(key, finish_time))
+        for key, finish_time in finish_times.items()
+    )
+
     return {
         "activation_usage": safe_usage(result.activation_cost, config.c_act),
         "bandwidth_usage": safe_usage(result.bandwidth_cost, config.c_bw),
         "forwarding_usage": safe_usage(result.forwarding_cost, config.c_fwd),
+        "inference_time_ms": inference_time_ms,
         "avg_servers_per_subtask": sum(server_counts) / len(server_counts) if server_counts else 0.0,
         "avg_experts_per_subtask": sum(expert_counts) / len(expert_counts) if expert_counts else 0.0,
     }
@@ -590,6 +604,7 @@ def average_run_results(run_results: list[dict[str, Any]], config: ExperimentCon
             activation_usage=sum(item["activation_usage"] for item in diagnostics) / count,
             bandwidth_usage=sum(item["bandwidth_usage"] for item in diagnostics) / count,
             forwarding_usage=sum(item["forwarding_usage"] for item in diagnostics) / count,
+            inference_time_ms=sum(item["inference_time_ms"] for item in diagnostics) / count,
             avg_servers_per_subtask=sum(item["avg_servers_per_subtask"] for item in diagnostics) / count,
             avg_experts_per_subtask=sum(item["avg_experts_per_subtask"] for item in diagnostics) / count,
         )
@@ -676,9 +691,6 @@ def run_experiment(config: ExperimentConfig | None = None) -> dict[str, Any]:
         filename=None,
     )
     return averages
-
-
-
 
 
 

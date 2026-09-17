@@ -15,7 +15,7 @@ class ExperimentConfig:
     # Reproducibility / output.
     auto_random_seed: bool = True
     num_runs: int = 100
-    num_dags: int = 5
+    num_dags: int = 8
     random_seed: int = 42
     network_random_seed: int = 1
     output_dir: Path = BASE_DIR / "generated_dags"
@@ -25,7 +25,7 @@ class ExperimentConfig:
     # DAG / task graph settings.
     common_dag_spec: DAGSpec = field(
         default_factory=lambda: DAGSpec(
-            num_nodes=6,
+            num_nodes=10,
             num_branches=(2,4),
             branch_length_range=(1, 5),
             depth=8,
@@ -39,8 +39,28 @@ class ExperimentConfig:
     )
 
     # Expert / task metadata settings.
-    num_experts: int = 16
+    num_experts: int = 8
     expert_memory_range: tuple[float, float] = (128.0, 256.0)
+    expert_inference_times_ms: tuple[float, ...] = (
+        35.0,
+        45.0,
+        58.0,
+        72.0,
+        88.0,
+        105.0,
+        125.0,
+        150.0,
+    )
+    expert_inference_costs: tuple[float, ...] = (
+        0.8,
+        1.0,
+        1.2,
+        1.4,
+        1.6,
+        1.8,
+        2.0,
+        2.2,
+    )
     task_deadline_seconds_range: tuple[int, int] = (30, 120)
     num_iot_features: int = 100
     iot_features_per_node_range: tuple[int, int] = (2, 5)
@@ -85,12 +105,12 @@ class ExperimentConfig:
 
     # RSMA / edge network settings. These follow the original SIoT-RSMA defaults
     # as closely as possible, with multiple edge servers and coverage limits.
-    num_edge_servers: int = 10
+    num_edge_servers: int = 15 #ori is 10
     num_iot_devices: int = 100
     area_size: float = 2000.0
     cell_radius: float = 350.0
     num_antennas: int = 4
-    iot_features_per_device_range: tuple[int, int] = (3, 12)
+    iot_features_per_device_range: tuple[int, int] = (4, 8)
     iot_server_feature_overlap_ratio: float = 0.20
     iot_global_random_feature_fraction: float = 0.2
     #experts_per_server: int = 5
@@ -99,6 +119,7 @@ class ExperimentConfig:
     server_gpu_memory_range: tuple[float, float] = (1280.0, 1792.0)
     wired_rate_range: tuple[float, float] = (5e8, 1.5e9)
     wired_extra_link_probability: float = 0.05
+    wired_edge_weight_range: tuple[float, float] = (5.0, 8.0) #8-10
     wavelength: float = 0.125
     feature_bits_range: tuple[float, float] = (8000.0, 80000.0)
     noise_power: float = 1e-18
@@ -107,15 +128,10 @@ class ExperimentConfig:
     max_group_size: int = 4
     min_rate: float = 1.0
 
-    # Objective cost weights.
-    # Calibrated so activation, bandwidth, and forwarding each contribute a
-    # similar order of magnitude in a typical run.
-    # 5,000 Hz bandwidth gap contributes 500 cost with c_bw=0.1.
-    c_bw: float = 0.05
-    c_act: float = 20.0
-    c_fwd: float = 1.0
-
-
+    # Objective unit costs from the simulation setup.
+    c_bw: float = 0.00002
+    c_act: float = 0.2
+    c_fwd: float = 1.0 #ori is 10.0
 
 
 
