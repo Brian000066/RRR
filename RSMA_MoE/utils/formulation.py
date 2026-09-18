@@ -924,27 +924,30 @@ class FormulationEvaluator:
     def group_common_features(self, group: GroupSpec) -> Set[str]:
         if not group.devices:
             return set()
-        payload = self.group_payload_features(group)
-        if not payload:
-            return set()
-        common = set(self.devices[group.devices[0]].features) & payload
+
+        common = set(self.devices[group.devices[0]].features)
         for device_id in group.devices[1:]:
-            common &= self.devices[device_id].features
+            common &= set(self.devices[device_id].features)
         return common
 
     def group_private_features(self, group: GroupSpec, device_id: DeviceId) -> Set[str]:
-        payload = self.group_payload_features(group)
         common = self.group_common_features(group)
-        return (set(self.devices[device_id].features) & payload) - common
+        return (set(self.devices[device_id].features)) - common
 
     def group_feature_volume(self, group: GroupSpec) -> float:
         return self.feature_set_volume(self.group_payload_features(group))
 
     def group_common_volume(self, group: GroupSpec) -> float:
-        return self.feature_set_volume(self.group_common_features(group))
+        """D_cmn(g) = number of common features times D_feat."""
+        common_features = self.group_common_features(group)
+        d_feat = max(float(self.config.default_feature_bits), 0.0)
+        return len(common_features) * d_feat
 
     def group_private_volume(self, group: GroupSpec, device_id: DeviceId) -> float:
-        return self.feature_set_volume(self.group_private_features(group, device_id))
+        """D_priv_n(g) = number of private features times D_feat."""
+        private_features = self.group_private_features(group, device_id)
+        d_feat = max(float(self.config.default_feature_bits), 0.0)
+        return len(private_features) * d_feat
 
     def feature_ready_time(
         self,
