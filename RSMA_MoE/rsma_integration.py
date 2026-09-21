@@ -94,6 +94,9 @@ def node_to_subtask(
     node: Mapping[str, Any],
     predecessors: Sequence[str],
     loss_threshold: float | None,
+    reasoning_data_sizes_bytes: Sequence[int] = (512,),
+    default_feature_bits: float = 12000.0,
+    rng: random.Random | None = None,
 ) -> dict[str, Any]:
     required_data = node.get("required_data", {})
     iot_features = required_data.get("iot_features", [])
@@ -104,14 +107,24 @@ def node_to_subtask(
         feature_name(feature): float(error)
         for feature, error in zip(iot_features, reconstruction_errors)
     }
+    reasoning_sizes = tuple(int(size) for size in reasoning_data_sizes_bytes)
+    if not reasoning_sizes or any(size <= 0 for size in reasoning_sizes):
+        raise ValueError("reasoning_data_sizes_bytes must contain positive values.")
+    rng = rng or random.Random()
+    reasoning_data_size_bytes = int(
+        node.get("reasoning_data_size_bytes", rng.choice(reasoning_sizes))
+    )
+    # The setup uses BF16 outputs (16 bits = 2 bytes per token).
+    output_tokens = math.ceil(reasoning_data_size_bytes / 2.0)
 
     return {
         "id": str(node_id),
         "unique_id": str(node.get("unique_subtask_id", node_id)),
         "required_features": [feature_name(index) for index in iot_features],
         "predecessors": [str(item) for item in predecessors],
-        "output_tokens": 256,
-        "feature_volume_bits": 8_000.0 * max(len(iot_features), 1),
+        "output_tokens": output_tokens,
+        "reasoning_data_size_bytes": reasoning_data_size_bytes,
+        "feature_volume_bits": float(default_feature_bits) * max(len(iot_features), 1),
         "loss_threshold": loss_threshold,
         "prompt": node.get("prompt", ""),
         "gating_weights": gating_weights,
@@ -125,6 +138,9 @@ def node_to_subtask(
 def graphs_to_tasks(
     graphs: Iterable[nx.DiGraph],
     loss_threshold: float | None,
+    reasoning_data_sizes_bytes: Sequence[int] = (512,),
+    default_feature_bits: float = 12000.0,
+    rng: random.Random | None = None,
 ) -> list[dict[str, Any]]:
     """Convert generated DAG objects into JRGEP scheduler task specs."""
     tasks: list[dict[str, Any]] = []
@@ -151,6 +167,9 @@ def graphs_to_tasks(
                     node,
                     predecessors,
                     loss_threshold,
+                    reasoning_data_sizes_bytes=reasoning_data_sizes_bytes,
+                    default_feature_bits=default_feature_bits,
+                    rng=rng,
                 )
             )
 
@@ -236,8 +255,9 @@ def normalize_float_range(
 def build_simple_experts(
     num_experts: int,
     memory_range: tuple[float, float] | None = None,
+    memory_sizes_mb: Sequence[float] | None = None,
     inference_times_ms: Sequence[float] | None = None,
-    inference_costs: Sequence[float] | None = None,
+    inference_unit_cost_per_mb: float = 0.06,
     rng: random.Random | None = None,
 ) -> dict[str, dict[str, float | int]]:
     """Create indexed experts with heterogeneous model sizes."""
@@ -245,19 +265,38 @@ def build_simple_experts(
         raise ValueError("num_experts must be at least 1.")
 
     rng = rng or random.Random()
-    memory_min, memory_max = normalize_float_range(memory_range, (256.0, 256.0), "expert_memory_range")
+    memory_values: tuple[float, ...] | None = None
+    if memory_sizes_mb is not None:
+        memory_values = tuple(float(value) for value in memory_sizes_mb)
+        if len(memory_values) != num_experts:
+            raise ValueError("expert_memory_sizes_mb length must match num_experts.")
+        if any(value <= 0.0 for value in memory_values):
+            raise ValueError("expert_memory_sizes_mb values must be positive.")
+        memory_min = memory_max = 0.0
+    else:
+        memory_min, memory_max = normalize_float_range(
+            memory_range,
+            (256.0, 256.0),
+            "expert_memory_range",
+        )
     if inference_times_ms is not None and len(inference_times_ms) != num_experts:
         raise ValueError("expert_inference_times_ms length must match num_experts.")
-    if inference_costs is not None and len(inference_costs) != num_experts:
-        raise ValueError("expert_inference_costs length must match num_experts.")
     if inference_times_ms is not None and any(value <= 0.0 for value in inference_times_ms):
         raise ValueError("expert_inference_times_ms values must be positive.")
-    if inference_costs is not None and any(value < 0.0 for value in inference_costs):
-        raise ValueError("expert_inference_costs values cannot be negative.")
+    if inference_unit_cost_per_mb < 0.0:
+        raise ValueError("inference_unit_cost_per_mb cannot be negative.")
 
     experts: dict[str, dict[str, float | int]] = {}
     for index in range(num_experts):
-        memory = memory_min if memory_min == memory_max else rng.uniform(memory_min, memory_max)
+        memory = (
+            memory_values[index]
+            if memory_values is not None
+            else (
+                memory_min
+                if memory_min == memory_max
+                else rng.uniform(memory_min, memory_max)
+            )
+        )
         experts[expert_id(index)] = {
             "index": index,
             "memory": memory,
@@ -266,11 +305,7 @@ def build_simple_experts(
                 if inference_times_ms is not None
                 else 0.05 + index * 0.01
             ),
-            "inference_cost": (
-                float(inference_costs[index])
-                if inference_costs is not None
-                else memory * 0.01
-            ),
+            "inference_cost": memory * float(inference_unit_cost_per_mb),
         }
     return experts
 
@@ -868,8 +903,10 @@ def build_scheduler_inputs(
     num_experts: int,
     num_iot_features: int,
     expert_memory_range: tuple[float, float] | None = None,
+    expert_memory_sizes_mb: Sequence[float] | None = None,
     expert_inference_times_ms: Sequence[float] | None = None,
-    expert_inference_costs: Sequence[float] | None = None,
+    inference_unit_cost_per_mb: float = 0.06,
+    reasoning_data_sizes_bytes: Sequence[int] = (512,),
     feature_bits_range: tuple[float, float] | None = None,
     num_servers: int = 9,
     num_iot_devices: int = 100,
@@ -892,13 +929,21 @@ def build_scheduler_inputs(
 ) -> SchedulerInputs:
     """Build the shared task/network objects used by all schedulers."""
     rng = random.Random(random_seed)
-    tasks = graphs_to_tasks(graphs, loss_threshold)
+    task_rng = random.Random(random_seed ^ 0x5EED5EED)
+    tasks = graphs_to_tasks(
+        graphs,
+        loss_threshold,
+        reasoning_data_sizes_bytes=reasoning_data_sizes_bytes,
+        default_feature_bits=default_feature_bits,
+        rng=task_rng,
+    )
     feature_bits_by_name = build_feature_bits(num_iot_features, default_feature_bits, feature_bits_range, rng)
     experts = build_simple_experts(
         num_experts,
         memory_range=expert_memory_range,
+        memory_sizes_mb=expert_memory_sizes_mb,
         inference_times_ms=expert_inference_times_ms,
-        inference_costs=expert_inference_costs,
+        inference_unit_cost_per_mb=inference_unit_cost_per_mb,
         rng=rng,
     )
     servers = build_simple_servers(

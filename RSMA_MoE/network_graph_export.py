@@ -19,13 +19,15 @@ def build_current_network_graph(config: ExperimentConfig, seeds: Any) -> tuple[l
 
     build_feature_bits(
         config.num_iot_features,
-        12_000.0,
+        config.default_feature_bits,
         config.feature_bits_range,
         rng,
     )
     experts = build_simple_experts(
         config.num_experts,
         memory_range=config.expert_memory_range,
+        memory_sizes_mb=config.expert_memory_sizes_mb,
+        inference_unit_cost_per_mb=config.c_inf,
         rng=rng,
     )
     servers = build_simple_servers(
@@ -208,4 +210,3 @@ def _draw_network_graph(
     fig.tight_layout(rect=[0, 0.05, 1, 0.94])
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
-

@@ -657,7 +657,7 @@ def generate_multiple_dags(
     reconstruction_sigma: float = 1.0,
     reconstruction_error_range: tuple[float, float] = (0.8, 1.5),
     gating_peak_count_range: tuple[int, int] = (2, 4),
-    gating_peak_mass_range: tuple[float, float] = (0.65, 0.85),
+    gating_peak_mass_range: tuple[float, float] = (0.45, 0.60),
     num_calibration_samples: int = 20,
     calibration_loss_range: tuple[float, float] = (1.0, 4.0),
     task_deadline_seconds_range: tuple[int, int] = (60, 60),

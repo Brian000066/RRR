@@ -558,8 +558,10 @@ def _run_wdmoe_pipeline(
     num_experts: int,
     num_iot_features: int,
     expert_memory_range: tuple[float, float] | None = None,
+    expert_memory_sizes_mb: Sequence[float] | None = None,
     expert_inference_times_ms: Sequence[float] | None = None,
-    expert_inference_costs: Sequence[float] | None = None,
+    inference_unit_cost_per_mb: float = 0.06,
+    reasoning_data_sizes_bytes: Sequence[int] = (512,),
     feature_bits_range: tuple[float, float] | None = None,
     top_k: int = 2,
     num_servers: int = 9,
@@ -605,8 +607,10 @@ def _run_wdmoe_pipeline(
         num_experts=num_experts,
         num_iot_features=num_iot_features,
         expert_memory_range=expert_memory_range,
+        expert_memory_sizes_mb=expert_memory_sizes_mb,
         expert_inference_times_ms=expert_inference_times_ms,
-        expert_inference_costs=expert_inference_costs,
+        inference_unit_cost_per_mb=inference_unit_cost_per_mb,
+        reasoning_data_sizes_bytes=reasoning_data_sizes_bytes,
         feature_bits_range=feature_bits_range,
         num_servers=num_servers,
         num_iot_devices=num_iot_devices,
@@ -700,6 +704,8 @@ def _run_wdmoe_pipeline(
             "num_iot_devices": num_iot_devices,
             "features_per_device_range": features_per_device_range,
             "expert_memory_range": expert_memory_range,
+            "expert_memory_sizes_mb": list(expert_memory_sizes_mb) if expert_memory_sizes_mb is not None else None,
+            "reasoning_data_sizes_bytes": list(reasoning_data_sizes_bytes),
             "experts_per_server": experts_per_server,
             "server_gpu_memory_range": server_gpu_memory_range,
             "wired_rate_range": wired_rate_range,
@@ -765,8 +771,6 @@ def run_wdmoe_gssgd(
         output_path,
         **kwargs,
     )
-
-
 
 
 

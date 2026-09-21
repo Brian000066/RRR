@@ -95,8 +95,10 @@ def common_scheduler_kwargs(config: ExperimentConfig, seeds: RunSeeds) -> dict[s
     return {
         "num_experts": config.num_experts,
         "expert_memory_range": config.expert_memory_range,
+        "expert_memory_sizes_mb": config.expert_memory_sizes_mb,
         "expert_inference_times_ms": config.expert_inference_times_ms,
-        "expert_inference_costs": config.expert_inference_costs,
+        "inference_unit_cost_per_mb": config.c_inf,
+        "reasoning_data_sizes_bytes": config.reasoning_data_sizes_bytes,
         "num_iot_features": config.num_iot_features,
         "num_servers": config.num_edge_servers,
         "num_iot_devices": config.num_iot_devices,
@@ -111,6 +113,7 @@ def common_scheduler_kwargs(config: ExperimentConfig, seeds: RunSeeds) -> dict[s
         "c_bw": config.c_bw,
         "c_act": config.c_act,
         "c_fwd": config.c_fwd,
+        "default_feature_bits": config.default_feature_bits,
         "feature_bits_range": config.feature_bits_range,
         "wavelength": config.wavelength,
         "noise_power": config.noise_power,
@@ -691,9 +694,6 @@ def run_experiment(config: ExperimentConfig | None = None) -> dict[str, Any]:
         filename=None,
     )
     return averages
-
-
-
 
 
 

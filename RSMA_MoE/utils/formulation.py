@@ -579,24 +579,25 @@ class FormulationEvaluator:
         budget = max(float(budget), 1e-12)
         common_efficiency, private_efficiencies = self.group_spectral_efficiencies(group)
         common_volume = self.group_common_volume(group)
-        common_required = self.group_common_volume(group) / (
+        common_required = common_volume / (
             budget * max(common_efficiency, 1e-12)
         )
 
         private_required = 0.0
         min_rate_required = 0.0
-        if common_volume > 0.0:
-            min_rate_required = max(
-                min_rate_required,
-                self.config.min_rate / max(common_efficiency, 1e-12),
-            )
         for device_id in group.devices:
             private_volume = self.group_private_volume(group, device_id)
-            efficiency = max(private_efficiencies.get(device_id, 0.0), 1e-12)
-            private_required += private_volume / (budget * efficiency)
+            private_efficiency = max(private_efficiencies.get(device_id, 0.0), 0.0)
+            private_required += private_volume / (
+                budget * max(private_efficiency, 1e-12)
+            )
+            aggregate_efficiency = max(
+                common_efficiency + private_efficiency,
+                1e-12,
+            )
             min_rate_required = max(
                 min_rate_required,
-                self.config.min_rate / efficiency,
+                self.config.min_rate / aggregate_efficiency,
             )
 
         return max(common_required + private_required, min_rate_required)
@@ -787,10 +788,10 @@ class FormulationEvaluator:
         common_rates: Mapping[Tuple[ServerId, GroupId], float],
         private_rates: Mapping[Tuple[ServerId, GroupId, DeviceId], float],
     ) -> List[str]:
-        """C7: minimum common/private transmission rate constraint.
+        """C7: minimum aggregate RSMA transmission rate constraint.
 
         B(n,g)=1 exactly when n is a member of group g. Non-members have
-        B(n,g)=0 and therefore do not need a private-rate check.
+        B(n,g)=0 and therefore do not need an aggregate-rate check.
         """
         violations: List[str] = []
         r_min = max(float(self.config.min_rate), 0.0)
@@ -800,21 +801,14 @@ class FormulationEvaluator:
         for group in groups:
             group_key = (group.server_id, group.id)
             common_rate = common_rates.get(group_key, 0.0)
-            if self.group_common_volume(group) > 0.0:
-                for device_id in group.devices:
-                    if common_rate < r_min:
-                        violations.append(
-                            f"C7 min common rate: device {device_id} in group {group_key} "
-                            f"{common_rate:.6g} < {r_min:.6g}"
-                        )
             for device_id in group.devices:
                 private_rate = private_rates.get((group.server_id, group.id, device_id), 0.0)
-                membership_indicator = 1.0
-                required_private_rate = membership_indicator * r_min
-                if private_rate < required_private_rate:
+                aggregate_rate = common_rate + private_rate
+                if aggregate_rate < r_min:
                     violations.append(
-                        f"C7 min private rate: device {device_id} in group {group_key} "
-                        f"{private_rate:.6g} < {required_private_rate:.6g}"
+                        f"C7 min aggregate rate: device {device_id} in group {group_key} "
+                        f"common={common_rate:.6g} + private={private_rate:.6g} "
+                        f"= {aggregate_rate:.6g} < {r_min:.6g}"
                     )
         return violations
 
@@ -925,14 +919,19 @@ class FormulationEvaluator:
         if not group.devices:
             return set()
 
-        common = set(self.devices[group.devices[0]].features)
+        payload = self.group_payload_features(group)
+        if not payload:
+            return set()
+
+        common = set(self.devices[group.devices[0]].features) & payload
         for device_id in group.devices[1:]:
-            common &= set(self.devices[device_id].features)
+            common &= set(self.devices[device_id].features) & payload
         return common
 
     def group_private_features(self, group: GroupSpec, device_id: DeviceId) -> Set[str]:
+        payload = self.group_payload_features(group)
         common = self.group_common_features(group)
-        return (set(self.devices[device_id].features)) - common
+        return (set(self.devices[device_id].features) & payload) - common
 
     def group_feature_volume(self, group: GroupSpec) -> float:
         return self.feature_set_volume(self.group_payload_features(group))

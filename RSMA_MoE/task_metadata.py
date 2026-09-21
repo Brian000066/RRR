@@ -9,7 +9,7 @@ def make_gating_weights(
     num_experts: int,
     rng: random.Random,
     peak_count_range: tuple[int, int] = (2, 4),
-    peak_mass_range: tuple[float, float] = (0.65, 0.85),
+    peak_mass_range: tuple[float, float] = (0.45, 0.60),
 ) -> list[float]:
     """Create peaked MoE gating weights whose sum is exactly 1.0.
 
@@ -162,7 +162,7 @@ def make_node_attributes(
     reconstruction_sigma: float = 1.0,
     reconstruction_error_range: tuple[float, float] = (0.8, 1.5),
     gating_peak_count_range: tuple[int, int] = (2, 4),
-    gating_peak_mass_range: tuple[float, float] = (0.65, 0.85),
+    gating_peak_mass_range: tuple[float, float] = (0.45, 0.60),
     num_calibration_samples: int = 20,
     calibration_loss_range: tuple[float, float] = (1.0, 4.0),
 ) -> dict[str, object]:
@@ -247,4 +247,3 @@ def make_task_deadline_seconds(
         )
 
     return rng.randint(min_seconds, max_seconds)
-
