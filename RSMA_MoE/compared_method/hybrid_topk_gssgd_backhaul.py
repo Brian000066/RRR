@@ -212,6 +212,7 @@ def run_hybrid_topk_gssgd_backhaul(
             c_bw=c_bw,
             c_act=c_act,
             c_fwd=c_fwd,
+            c_inf=inference_unit_cost_per_mb,
             derive_bandwidth=True,
             noise_power=noise_power,
             common_power_ratio=common_power_ratio,
@@ -232,7 +233,7 @@ def run_hybrid_topk_gssgd_backhaul(
             "activation": c_act,
             "bandwidth": c_bw,
             "forwarding": c_fwd,
-            "inference": 1.0,
+            "inference": inference_unit_cost_per_mb,
         },
         "gssgd_parameters": {
             "top_k": top_k,
@@ -279,14 +280,18 @@ def run_hybrid_topk_gssgd_backhaul(
             result_to_jsonable(
                 result,
                 network_context,
-                cost_units={"activation": c_act, "bandwidth": c_bw, "forwarding": c_fwd, "inference": 1.0},
+                cost_units={
+                    "activation": c_act,
+                    "bandwidth": c_bw,
+                    "forwarding": c_fwd,
+                    "inference": inference_unit_cost_per_mb,
+                },
             ),
             file,
             ensure_ascii=False,
             indent=2,
         )
     return result
-
 
 
 

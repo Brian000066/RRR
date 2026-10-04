@@ -654,6 +654,7 @@ def _run_wdmoe_pipeline(
             c_bw=c_bw,
             c_act=c_act,
             c_fwd=c_fwd,
+            c_inf=inference_unit_cost_per_mb,
             derive_bandwidth=True,
             noise_power=noise_power,
             common_power_ratio=common_power_ratio,
@@ -681,7 +682,7 @@ def _run_wdmoe_pipeline(
             "activation": c_act,
             "bandwidth": c_bw,
             "forwarding": c_fwd,
-            "inference": 1.0,
+            "inference": inference_unit_cost_per_mb,
         },
         "wdmoe_parameters": {
             "algorithm": "WDMoE-Based DAG-Aware Expert Selection",
@@ -734,7 +735,12 @@ def _run_wdmoe_pipeline(
     payload = hybrid_result_to_jsonable(
         result,
         network_context,
-        cost_units={"activation": c_act, "bandwidth": c_bw, "forwarding": c_fwd, "inference": 1.0},
+        cost_units={
+            "activation": c_act,
+            "bandwidth": c_bw,
+            "forwarding": c_fwd,
+            "inference": inference_unit_cost_per_mb,
+        },
     )
     payload["method"] = method_name
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -771,7 +777,6 @@ def run_wdmoe_gssgd(
         output_path,
         **kwargs,
     )
-
 
 
 

@@ -286,7 +286,12 @@ def print_method_result(method_name: str, result_path, result: Any, config: Expe
     print_cost_line("Activation", result.activation_cost, config.c_act, "activated expert memory")
     print_cost_line("Bandwidth", result.bandwidth_cost, config.c_bw, "Hz")
     print_cost_line("Forwarding", result.forwarding_cost, config.c_fwd, "forwarding events")
-    print_cost_line("Inference", getattr(result, "inference_cost", 0.0), 1.0, "expert inference cost units")
+    print_cost_line(
+        "Inference",
+        getattr(result, "inference_cost", 0.0),
+        config.c_inf,
+        "executed expert memory (MB)",
+    )
     print_diagnostics(result, config)
     print(f"{method_name} violations: {len(result.violations)}")
     if method_name == "JRGEP" and graphs is not None:
@@ -624,7 +629,12 @@ def print_average_results(averages: dict[str, AverageResult], config: Experiment
         print_cost_line("Activation", result.activation_cost, config.c_act, "activated expert memory")
         print_cost_line("Bandwidth", result.bandwidth_cost, config.c_bw, "Hz")
         print_cost_line("Forwarding", result.forwarding_cost, config.c_fwd, "forwarding events")
-        print_cost_line("Inference", result.inference_cost, 1.0, "expert inference cost units")
+        print_cost_line(
+            "Inference",
+            result.inference_cost,
+            config.c_inf,
+            "executed expert memory (MB)",
+        )
         print("Average diagnostics:")
         print(
             "  Assignment: "
@@ -694,7 +704,6 @@ def run_experiment(config: ExperimentConfig | None = None) -> dict[str, Any]:
         filename=None,
     )
     return averages
-
 
 
 

@@ -1,4 +1,4 @@
-"""JRGEP: similarity-aware expert selection, IoT grouping, and backhaul repair."""
+"""JRGEP pipeline: SCOPE placement, CFRG grouping, and Phase-III refinement."""
 
 from __future__ import annotations
 
@@ -55,8 +55,16 @@ class SimilarityAwareTopKBackhaulPipeline(
         config: Optional[FormulationConfig] = None,
         placement_random_seed: Optional[int] = None,
     ):
+        server_items = list(servers.values()) if isinstance(servers, Mapping) else list(servers)
+        self.physical_wired_links: tuple[dict[str, Any], ...] = tuple()
+        for raw_server in server_items:
+            server_data = raw_server if isinstance(raw_server, Mapping) else vars(raw_server)
+            links = server_data.get("physical_wired_links", ())
+            if links:
+                self.physical_wired_links = tuple(dict(link) for link in links)
+                break
         super().__init__(
-            servers=servers,
+            servers=server_items,
             devices=devices,
             experts=experts,
             tasks=tasks,
@@ -71,25 +79,25 @@ class SimilarityAwareTopKBackhaulPipeline(
         self.server_spread_penalty_multiplier = float(server_spread_penalty_multiplier)
         self.predecessor_penalty_multiplier = float(predecessor_penalty_multiplier)
         self.phase1_report: dict[str, Any] = {
-            "mode": "similarity_cluster_marginal_cost_selection",
+            "mode": "SCOPE",
             "similarity_pairs": len(self.r_sim),
             "similarity_weight": self.similarity_weight,
+            "similarity_smoothing_applied": False,
             "server_spread_penalty_multiplier": self.server_spread_penalty_multiplier,
             "predecessor_penalty_multiplier": self.predecessor_penalty_multiplier,
         }
-        self.phase2_report: dict[str, Any] = {"mode": "minimum_cost_group_repair"}
+        self.phase2_report: dict[str, Any] = {"mode": "CFRG"}
         self.phase3_report: dict[str, Any] = {
-            "mode": "assignment_refinement",
-            "max_iterations": 0,
-            "max_candidates_per_strategy": 6,
-            "bandwidth_increase_tolerance": 0.0,
+            "mode": "FAR",
+            "max_iterations": 2,
+            "max_joint_assignments": 32,
+            "max_private_candidates": 48,
+            "physical_link_count": len(self.physical_wired_links),
         }
         self.post_pruning_report: dict[str, Any] = {
             "enabled": self.enable_offline_group_pruning,
             "mode": "offline_final_group_pruning",
         }
-        if self.r_sim and self.similarity_weight > 0.0:
-            self._apply_similarity_smoothing()
 
     def run(self) -> ChainedPipelineResult:
         assignments, selected_probability, selected_experts, activated, used_memory = self._assign_topk_experts()
@@ -300,6 +308,7 @@ def run_similarity_aware_topk_backhaul(
             c_bw=c_bw,
             c_act=c_act,
             c_fwd=c_fwd,
+            c_inf=inference_unit_cost_per_mb,
             derive_bandwidth=True,
             noise_power=noise_power,
             common_power_ratio=common_power_ratio,
@@ -346,7 +355,12 @@ def run_similarity_aware_topk_backhaul(
     payload = hybrid_result_to_jsonable(
         result,
         network_context,
-        cost_units={"activation": c_act, "bandwidth": c_bw, "forwarding": c_fwd, "inference": 1.0},
+        cost_units={
+            "activation": c_act,
+            "bandwidth": c_bw,
+            "forwarding": c_fwd,
+            "inference": inference_unit_cost_per_mb,
+        },
     )
     payload["method"] = "jrgep"
     payload["algorithm_reports"] = {

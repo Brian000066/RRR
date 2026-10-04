@@ -116,7 +116,7 @@ class ExperimentConfig:
     iot_global_random_feature_fraction: float = 0.2
     #experts_per_server: int = 5
     experts_per_server: int = 8
-    #server_gpu_memory_range: tuple[float, float] = (640.0, 896.0)
+    #server_gpu_memory_range: tuple[float, float] = (640.0, 896.0) (1280.0, 1792.0)
     server_gpu_memory_range: tuple[float, float] = (1280.0, 1792.0)
     # Paper: [10, 100] MB/s = [80, 800] Mbit/s.
     wired_rate_range: tuple[float, float] = (80e6, 800e6)
@@ -140,7 +140,7 @@ class ExperimentConfig:
     # Objective unit costs from the simulation setup.
     c_bw: float = 0.000025
     c_act: float = 2.5
-    c_fwd: float = 1.0 #ori is 10.0
+    c_fwd: float = 1.0
     c_inf: float = 0.06
 
 

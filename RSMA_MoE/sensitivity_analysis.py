@@ -115,7 +115,12 @@ def print_point_summary(
         print_cost_line("Activation", result.activation_cost, config.c_act, "activated expert memory")
         print_cost_line("Bandwidth", result.bandwidth_cost, config.c_bw, "Hz")
         print_cost_line("Forwarding", result.forwarding_cost, config.c_fwd, "forwarding events")
-        print_cost_line("Inference", result.inference_cost, 1.0, "expert inference cost units")
+        print_cost_line(
+            "Inference",
+            result.inference_cost,
+            config.c_inf,
+            "executed expert memory (MB)",
+        )
 
 
 def loss_bound_text(config: ExperimentConfig) -> str:
@@ -346,7 +351,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
 
 

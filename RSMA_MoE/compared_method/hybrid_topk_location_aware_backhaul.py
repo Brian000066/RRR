@@ -24,6 +24,7 @@ from utils.formulation import (  # noqa: E402
     FormulationEvaluator,
     GroupId,
     GroupSpec,
+    InfeasibleBandwidthBudget,
     ServerId,
     SubtaskSpec,
     normalize_devices,
@@ -794,7 +795,15 @@ class ChainedComparisonPipeline:
     ) -> float:
         cost = 0.0
         group_key = (group.server_id, group.id)
-        new_budget = self._subtask_bandwidth_budget(key, assignments)
+        try:
+            new_budget = self._subtask_bandwidth_budget(
+                key,
+                assignments,
+                group,
+                target_servers,
+            )
+        except InfeasibleBandwidthBudget:
+            return float("inf")
         if group_key in active_groups:
             old_budget = active_group_budgets.get(group_key, self.evaluator.bandwidth_time_budget())
             resolved_budget = min(old_budget, new_budget)
@@ -815,13 +824,31 @@ class ChainedComparisonPipeline:
         self,
         key: AssignmentKey,
         assignments: Mapping[AssignmentKey, Sequence[Tuple[ServerId, ExpertId]]],
+        group: GroupSpec | None = None,
+        target_servers: Sequence[ServerId] = (),
     ) -> float:
         task = self.tasks.get(key[0])
         if task is None or task.deadline == float("inf"):
             return self.evaluator.bandwidth_time_budget()
-        downstream = self._downstream_compute_times(assignments)
-        remaining = task.deadline - downstream.get(key, 0.0)
-        return max(remaining, 1e-12)
+        latest_start = self.evaluator.latest_subtask_start_times(assignments)
+        remaining = latest_start.get(key, task.deadline)
+        if group is not None:
+            for target_server in target_servers:
+                if group.server_id == target_server:
+                    continue
+                remaining = min(
+                    remaining,
+                    latest_start.get(key, task.deadline)
+                    - self.evaluator.group_feature_volume(group)
+                    / self.evaluator.wired_rate(group.server_id, target_server),
+                )
+        if remaining <= 0.0:
+            raise InfeasibleBandwidthBudget(
+                f"RSMA group {group.server_id}:{group.id} cannot serve "
+                f"{key[0]}:{key[1]}: remaining uplink time is "
+                f"{remaining:.6g}s"
+            )
+        return remaining
     def _candidate_server_features(self, assignments):
         required = {server_id: set() for server_id in self.servers}
         for task in self.tasks.values():
@@ -1053,7 +1080,7 @@ class ChainedComparisonPipeline:
 
     def _derive_backhaul(self, subtask_data_requirements, feature_to_groups):
         backhaul: Set[BackhaulEdge] = set()
-        features_by_edge: Dict[BackhaulEdge, Set[str]] = {}
+        source_by_edge: Dict[BackhaulEdge, GroupSpec] = {}
         for server_map in subtask_data_requirements.values():
             for target_server, features in server_map.items():
                 for feature in features:
@@ -1068,9 +1095,18 @@ class ChainedComparisonPipeline:
                         continue
                     edge = (source.server_id, source.id, target_server)
                     backhaul.add(edge)
-                    features_by_edge.setdefault(edge, set()).add(feature)
+                    source_by_edge[edge] = source
         plan = [
-            ChainedBackhaulDecision(source_server=s, group_id=g, target_server=t, features=sorted(features_by_edge[(s, g, t)]))
+            ChainedBackhaulDecision(
+                source_server=s,
+                group_id=g,
+                target_server=t,
+                features=sorted(
+                    self.evaluator.group_transmitted_features(
+                        source_by_edge[(s, g, t)]
+                    )
+                ),
+            )
             for s, g, t in sorted(backhaul)
         ]
         return backhaul, plan
@@ -1090,12 +1126,12 @@ class ChainedComparisonPipeline:
 
     def _derive_group_bandwidths(self, groups, assignments, data_req, backhaul, feature_to_groups):
         dependencies = self._group_dependencies(groups, assignments, data_req, backhaul, feature_to_groups)
-        downstream = self._downstream_compute_times(assignments)
+        latest_start = self.evaluator.latest_subtask_start_times(assignments)
         budgets: Dict[GroupKey, float] = {}
         resolved: List[GroupSpec] = []
         for group in groups:
             group_key = (group.server_id, group.id)
-            budget = self._strict_group_budget(group, dependencies, downstream)
+            budget = self._strict_group_budget(group, dependencies, latest_start)
             budgets[group_key] = budget
             bandwidth = self.evaluator.derive_group_bandwidth_for_budget(group, budget)
             resolved.append(replace(group, bandwidth=bandwidth))
@@ -1149,7 +1185,7 @@ class ChainedComparisonPipeline:
     def _subtask_compute_time(self, key, assignments):
         return max((self.experts[eid].latency for _, eid in assignments.get(key, [])), default=0.0)
 
-    def _strict_group_budget(self, group, dependencies, downstream):
+    def _strict_group_budget(self, group, dependencies, latest_start):
         group_key = (group.server_id, group.id)
         dependent_items = dependencies.get(group_key, set())
         if not dependent_items:
@@ -1163,9 +1199,18 @@ class ChainedComparisonPipeline:
                 backhaul_time = 0.0
                 if group.server_id != target_server:
                     backhaul_time = self.evaluator.group_feature_volume(group) / self.evaluator.wired_rate(group.server_id, target_server)
-                remaining = task.deadline - downstream.get((task_id, subtask_id), 0.0) - backhaul_time
-                budgets.append(max(remaining, 1e-12))
-        return max(min(budgets), 1e-12)
+                remaining = (
+                    latest_start.get((task_id, subtask_id), task.deadline)
+                    - backhaul_time
+                )
+                if remaining <= 0.0:
+                    raise InfeasibleBandwidthBudget(
+                        f"RSMA group {group.server_id}:{group.id} cannot serve "
+                        f"{task_id}:{subtask_id} on {target_server}: remaining "
+                        f"uplink time is {remaining:.6g}s"
+                    )
+                budgets.append(remaining)
+        return min(budgets)
 
     def _derive_bandwidth_for_budget(self, group, budget):
         if not group.devices or not group.required_features:
@@ -1401,6 +1446,7 @@ def run_chained_pipeline(
             c_bw=c_bw,
             c_act=c_act,
             c_fwd=c_fwd,
+            c_inf=inference_unit_cost_per_mb,
             derive_bandwidth=True,
             noise_power=noise_power,
             common_power_ratio=common_power_ratio,
@@ -1424,7 +1470,7 @@ def run_chained_pipeline(
             "activation": c_act,
             "bandwidth": c_bw,
             "forwarding": c_fwd,
-            "inference": 1.0,
+            "inference": inference_unit_cost_per_mb,
         },
         "hybrid_algorithm_parameters": {
             "top_k": top_k,
@@ -1472,18 +1518,18 @@ def run_chained_pipeline(
             result_to_jsonable(
                 result,
                 network_context,
-                cost_units={"activation": c_act, "bandwidth": c_bw, "forwarding": c_fwd, "inference": 1.0},
+                cost_units={
+                    "activation": c_act,
+                    "bandwidth": c_bw,
+                    "forwarding": c_fwd,
+                    "inference": inference_unit_cost_per_mb,
+                },
             ),
             file,
             ensure_ascii=False,
             indent=2,
         )
     return result
-
-
-
-
-
 
 
 

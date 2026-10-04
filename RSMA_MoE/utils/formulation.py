@@ -14,6 +14,10 @@ GroupId = str
 AssignmentKey = Tuple[TaskId, SubtaskId]
 
 
+class InfeasibleBandwidthBudget(ValueError):
+    """Raised when no positive uplink time remains for an RSMA group."""
+
+
 @dataclass(frozen=True)
 class ExpertSpec:
     id: ExpertId
@@ -88,6 +92,7 @@ class FormulationConfig:
     c_bw: float = 1e-3
     c_act: float = 1.0
     c_fwd: float = 1.0
+    c_inf: Optional[float] = None
     derive_bandwidth: bool = True
     default_channel_gain: float = 1.0
     default_power: float = 1.0
@@ -367,7 +372,11 @@ class FormulationEvaluator:
             if expert_id in self.experts
         )
         inference_cost = sum(
-            self.experts[expert_id].inference_cost
+            (
+                self.config.c_inf * self.experts[expert_id].memory
+                if self.config.c_inf is not None
+                else self.experts[expert_id].inference_cost
+            )
             for pairs in assignments.values()
             for _, expert_id in pairs
             if expert_id in self.experts
@@ -434,24 +443,36 @@ class FormulationEvaluator:
         backhaul: Set[Tuple[ServerId, GroupId, ServerId]],
     ) -> Dict[Tuple[ServerId, GroupId], float]:
         dependencies = self.group_dependencies(groups, assignments, backhaul)
-        downstream = self.downstream_compute_times(assignments)
+        latest_start = self.latest_subtask_start_times(assignments)
         fallback = self.bandwidth_time_budget()
         budgets: Dict[Tuple[ServerId, GroupId], float] = {}
         for group in groups:
             group_key = (group.server_id, group.id)
-            dependent_keys = dependencies.get(group_key, set())
-            if not dependent_keys:
+            dependent_items = dependencies.get(group_key, set())
+            if not dependent_items:
                 budgets[group_key] = fallback
                 continue
             candidates: List[float] = []
-            for task_id, subtask_id in dependent_keys:
+            for (task_id, subtask_id), target_server in dependent_items:
                 task = self.tasks.get(task_id)
                 if task is None or task.deadline == float("inf"):
                     candidates.append(fallback)
                     continue
-                remaining = task.deadline - downstream.get((task_id, subtask_id), 0.0)
-                candidates.append(max(remaining, 1e-12))
-            budgets[group_key] = max(min(candidates), 1e-12)
+                backhaul_time = 0.0
+                if group.server_id != target_server:
+                    backhaul_time = self.group_feature_volume(group) / self.wired_rate(
+                        group.server_id,
+                        target_server,
+                    )
+                remaining = latest_start.get((task_id, subtask_id), task.deadline) - backhaul_time
+                if remaining <= 0.0:
+                    raise InfeasibleBandwidthBudget(
+                        f"RSMA group {group.server_id}:{group.id} cannot serve "
+                        f"{task_id}:{subtask_id} on {target_server}: remaining "
+                        f"uplink time is {remaining:.6g}s"
+                    )
+                candidates.append(remaining)
+            budgets[group_key] = min(candidates)
         return budgets
 
     def group_dependencies(
@@ -459,14 +480,17 @@ class FormulationEvaluator:
         groups: Sequence[GroupSpec],
         assignments: Mapping[AssignmentKey, Sequence[Tuple[ServerId, ExpertId]]],
         backhaul: Set[Tuple[ServerId, GroupId, ServerId]],
-    ) -> Dict[Tuple[ServerId, GroupId], Set[AssignmentKey]]:
+    ) -> Dict[Tuple[ServerId, GroupId], Set[Tuple[AssignmentKey, ServerId]]]:
         group_by_key = {(group.server_id, group.id): group for group in groups}
         feature_to_groups: Dict[str, List[GroupSpec]] = {}
         for group in groups:
             for feature in self.group_payload_features(group):
                 feature_to_groups.setdefault(feature, []).append(group)
 
-        dependencies: Dict[Tuple[ServerId, GroupId], Set[AssignmentKey]] = {
+        dependencies: Dict[
+            Tuple[ServerId, GroupId],
+            Set[Tuple[AssignmentKey, ServerId]],
+        ] = {
             key: set() for key in group_by_key
         }
         for task in self.tasks.values():
@@ -476,7 +500,9 @@ class FormulationEvaluator:
                     for feature in subtask.required_features:
                         group = self.serving_group_for_feature(feature, target_server, feature_to_groups, backhaul)
                         if group is not None:
-                            dependencies.setdefault((group.server_id, group.id), set()).add(key)
+                            dependencies.setdefault((group.server_id, group.id), set()).add(
+                                (key, target_server)
+                            )
         return dependencies
 
     def serving_group_for_feature(
@@ -533,6 +559,94 @@ class FormulationEvaluator:
                 visit(subtask)
         return downstream
 
+    def dependency_forwarding_time(
+        self,
+        task_id: TaskId,
+        predecessor_id: SubtaskId,
+        successor_id: SubtaskId,
+        assignments: Mapping[AssignmentKey, Sequence[Tuple[ServerId, ExpertId]]],
+    ) -> float:
+        """Worst predecessor-output delay for one DAG edge under C8 placement."""
+        predecessor_key = (task_id, predecessor_id)
+        successor_key = (task_id, successor_id)
+        predecessor_servers = self.participating_servers(assignments, predecessor_key)
+        successor_servers = self.participating_servers(assignments, successor_key)
+        delay = 0.0
+        for source_server in predecessor_servers:
+            output_bits = self.subtask_output_volume(
+                predecessor_key,
+                source_server,
+                assignments,
+            )
+            for target_server in successor_servers:
+                if source_server == target_server:
+                    continue
+                delay = max(
+                    delay,
+                    output_bits / self.wired_rate(source_server, target_server),
+                )
+        return delay
+
+    def latest_subtask_start_times(
+        self,
+        assignments: Mapping[AssignmentKey, Sequence[Tuple[ServerId, ExpertId]]],
+    ) -> Dict[AssignmentKey, float]:
+        """Reverse-DAG latest starts used by the CFRG bandwidth budget.
+
+        A sink must start no later than its deadline minus its computation
+        time.  Every other node must finish, and forward its output when the
+        next node is remote, before the successor's latest start.
+        """
+        latest: Dict[AssignmentKey, float] = {}
+        visiting: Set[AssignmentKey] = set()
+
+        for task in self.tasks.values():
+            subtask_by_id = {subtask.id: subtask for subtask in task.subtasks}
+            children: Dict[SubtaskId, List[SubtaskId]] = {
+                subtask.id: [] for subtask in task.subtasks
+            }
+            for subtask in task.subtasks:
+                for predecessor_id in subtask.predecessors:
+                    if predecessor_id in children:
+                        children[predecessor_id].append(subtask.id)
+
+            def visit(subtask_id: SubtaskId) -> float:
+                key = (task.id, subtask_id)
+                if key in latest:
+                    return latest[key]
+                if key in visiting:
+                    raise ValueError(f"Task {task.id} is not a DAG")
+                visiting.add(key)
+                compute_time = max(
+                    (
+                        self.server_computation_time(key, server_id, assignments)
+                        for server_id in self.participating_servers(assignments, key)
+                    ),
+                    default=0.0,
+                )
+                successors = children.get(subtask_id, [])
+                if not successors:
+                    value = task.deadline - compute_time
+                else:
+                    value = min(
+                        visit(successor_id)
+                        - compute_time
+                        - self.dependency_forwarding_time(
+                            task.id,
+                            subtask_id,
+                            successor_id,
+                            assignments,
+                        )
+                        for successor_id in successors
+                    )
+                visiting.remove(key)
+                latest[key] = value
+                return value
+
+            for subtask_id in subtask_by_id:
+                visit(subtask_id)
+        return latest
+
     def group_spectral_efficiencies(
         self,
         group: GroupSpec,
@@ -576,7 +690,12 @@ class FormulationEvaluator:
     def derive_group_bandwidth_for_budget(self, group: GroupSpec, budget: float) -> float:
         if not group.devices:
             return 0.0
-        budget = max(float(budget), 1e-12)
+        budget = float(budget)
+        if budget <= 0.0:
+            raise InfeasibleBandwidthBudget(
+                f"RSMA group {group.server_id}:{group.id} has non-positive "
+                f"uplink time budget {budget:.6g}s"
+            )
         common_efficiency, private_efficiencies = self.group_spectral_efficiencies(group)
         common_volume = self.group_common_volume(group)
         common_required = common_volume / (
@@ -588,8 +707,11 @@ class FormulationEvaluator:
         for device_id in group.devices:
             private_volume = self.group_private_volume(group, device_id)
             private_efficiency = max(private_efficiencies.get(device_id, 0.0), 0.0)
-            private_required += private_volume / (
-                budget * max(private_efficiency, 1e-12)
+            private_required = max(
+                private_required,
+                private_volume / (
+                    budget * max(private_efficiency, 1e-12)
+                ),
             )
             aggregate_efficiency = max(
                 common_efficiency + private_efficiency,
@@ -600,7 +722,7 @@ class FormulationEvaluator:
                 self.config.min_rate / aggregate_efficiency,
             )
 
-        return max(common_required + private_required, min_rate_required)
+        return max(common_required, private_required, min_rate_required)
 
     def compute_rates(
         self, groups: Sequence[GroupSpec]
@@ -851,10 +973,10 @@ class FormulationEvaluator:
         return sum(self.spatial_correlation(device_id, other_id, server_id) for other_id in others) / len(others)
 
     def common_message_ratio(self, group: GroupSpec) -> float:
-        payload = self.group_payload_features(group)
-        if not payload:
+        transmitted = self.group_transmitted_features(group)
+        if not transmitted:
             return 0.0
-        return len(self.group_common_features(group)) / len(payload)
+        return len(self.group_common_features(group)) / len(transmitted)
 
     def db_phase_term(self, device_id: DeviceId, server_id: ServerId) -> complex:
         device = self.devices[device_id]
@@ -907,34 +1029,35 @@ class FormulationEvaluator:
     def device_feature_volume(self, device_id: DeviceId) -> float:
         return self.feature_set_volume(self.devices[device_id].features)
 
-    def group_payload_features(self, group: GroupSpec) -> Set[str]:
-        payload: Set[str] = set()
+    def group_transmitted_features(self, group: GroupSpec) -> Set[str]:
+        """All features uploaded by the IoT devices selected for this group."""
+        transmitted: Set[str] = set()
         for device_id in group.devices:
-            payload.update(self.devices[device_id].features)
-        if group.required_features:
-            payload &= set(group.required_features)
-        return payload
+            transmitted.update(self.devices[device_id].features)
+        return transmitted
+
+    def group_payload_features(self, group: GroupSpec) -> Set[str]:
+        """Complete feature union uploaded by the selected IoT devices."""
+        return self.group_transmitted_features(group)
 
     def group_common_features(self, group: GroupSpec) -> Set[str]:
+        """Intersection of the complete feature sets of all selected IoTs."""
         if not group.devices:
             return set()
 
-        payload = self.group_payload_features(group)
-        if not payload:
-            return set()
-
-        common = set(self.devices[group.devices[0]].features) & payload
+        common = set(self.devices[group.devices[0]].features)
         for device_id in group.devices[1:]:
-            common &= set(self.devices[device_id].features) & payload
+            common &= set(self.devices[device_id].features)
         return common
 
     def group_private_features(self, group: GroupSpec, device_id: DeviceId) -> Set[str]:
-        payload = self.group_payload_features(group)
+        """Complete device feature set excluding the group-common features."""
         common = self.group_common_features(group)
-        return (set(self.devices[device_id].features) & payload) - common
+        return set(self.devices[device_id].features) - common
 
     def group_feature_volume(self, group: GroupSpec) -> float:
-        return self.feature_set_volume(self.group_payload_features(group))
+        """Complete IoT-group volume forwarded over each active backhaul."""
+        return self.feature_set_volume(self.group_transmitted_features(group))
 
     def group_common_volume(self, group: GroupSpec) -> float:
         """D_cmn(g) = number of common features times D_feat."""
