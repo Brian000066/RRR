@@ -34,7 +34,7 @@ class ExperimentConfig:
             allow_skip_edges=False,
             allow_early_branch_end=True,
             single_source=True,
-            single_sink=False,
+            single_sink=True,
         )
     )
 
@@ -114,14 +114,12 @@ class ExperimentConfig:
     iot_features_per_device_range: tuple[int, int] = (4, 8)
     iot_server_feature_overlap_ratio: float = 0.20
     iot_global_random_feature_fraction: float = 0.2
-    #experts_per_server: int = 5
-    experts_per_server: int = 8
-    #server_gpu_memory_range: tuple[float, float] = (640.0, 896.0) (1280.0, 1792.0)
-    server_gpu_memory_range: tuple[float, float] = (1280.0, 1792.0)
+    experts_per_server: int = 5
+    server_gpu_memory_range: tuple[float, float] = (130.0, 150.0)
     # Paper: [10, 100] MB/s = [80, 800] Mbit/s.
     wired_rate_range: tuple[float, float] = (80e6, 800e6)
     wired_extra_link_probability: float = 0.05
-    wired_edge_weight_range: tuple[float, float] = (23.0, 25.0) #8-10
+    wired_edge_weight_range: tuple[float, float] = (1.0, 3.0) #8-10
     wavelength: float = 0.125
     # Paper: 16 KiB per feature.
     default_feature_bits: float = 16.0 * 1024.0 * 8.0
@@ -139,12 +137,9 @@ class ExperimentConfig:
 
     # Objective unit costs from the simulation setup.
     c_bw: float = 0.000025
-    c_act: float = 2.5
+    c_act: float = 0.6
     c_fwd: float = 1.0
     c_inf: float = 0.06
-
-
-
 
 
 

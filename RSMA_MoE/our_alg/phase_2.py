@@ -24,6 +24,9 @@ from utils.formulation import (
 )
 
 
+Demand = Tuple[ServerId, str]
+
+
 class Phase2GroupingBackhaulMixin:
     """Phase II: CFRG IoT selection, compatibility ordering, and grouping."""
 
@@ -118,7 +121,8 @@ class Phase2GroupingBackhaulMixin:
 
         self.phase2_report.update(
             {
-                "mode": "CFRG",
+                "mode": "CFRG_updated",
+                "selection_version": "two_stage_coverage_then_localization",
                 "initial_feature_deficits": {
                     server_id: sorted(features)
                     for server_id, features in initial_deficits.items()
@@ -141,8 +145,14 @@ class Phase2GroupingBackhaulMixin:
                 "backhaul_plan": [decision.__dict__ for decision in backhaul_plan],
                 "selection_index_formula": (
                     "Delta_n*|h[n,o_n]|^2 / "
-                    "((1+sum_s w[o_n,s])*(1+delta_n))"
+                    "([1+c_bw*b(n)+c_fwd*sum_s omega_net[o_n,s]]*(1+delta_n))"
                 ),
+                "localization_index_formula": (
+                    "normalized_hop_reduction / "
+                    "(normalized_c_bw_b(n)*(1+normalized_delta_n)+epsilon)"
+                ),
+                "localization_acceptance_threshold": 1.0,
+                "pruning_rule": "remove selected IoTs whose destination set is empty",
                 "compatibility_formula": (
                     "min_s distance(n,m)*(2-cos(phase_angle[n,s]-phase_angle[m,s]))"
                 ),
@@ -211,7 +221,7 @@ class Phase2GroupingBackhaulMixin:
         deficits: Mapping[ServerId, Set[str]],
     ) -> tuple[
         list[DeviceId],
-        Dict[Tuple[ServerId, str], DeviceId],
+        Dict[Demand, DeviceId],
         Dict[ServerId, Set[str]],
         list[dict[str, Any]],
     ]:
@@ -220,11 +230,14 @@ class Phase2GroupingBackhaulMixin:
             for server_id, features in deficits.items()
         }
         selected: list[DeviceId] = []
-        ownership: Dict[Tuple[ServerId, str], DeviceId] = {}
+        ownership: Dict[Demand, DeviceId] = {}
         report: list[dict[str, Any]] = []
 
+        # Stage 1: cover every outstanding (server, feature) demand while
+        # charging both the candidate uplink bandwidth and forwarding hops.
+        coverage_iteration = 0
         while any(remaining.values()):
-            candidates = []
+            candidates: list[dict[str, Any]] = []
             for device_id in self.devices:
                 if device_id in selected:
                     continue
@@ -237,79 +250,249 @@ class Phase2GroupingBackhaulMixin:
                 coverage_gain = sum(len(features) for features in covered_by_server.values())
                 if coverage_gain <= 0:
                     continue
-                reachable = self._cfrg_reachable_servers(device_id)
-                if not reachable:
+                origin = self._updated_best_origin(device_id)
+                if origin is None:
                     continue
-                origin = max(
-                    reachable,
-                    key=lambda server_id: (
-                        self.evaluator.channel_gain(device_id, server_id) ** 2,
-                        server_id,
-                    ),
+                required_features = set().union(*covered_by_server.values())
+                singleton_bandwidth = self._updated_singleton_bandwidth(
+                    device_id,
+                    origin,
+                    required_features,
                 )
-                channel_quality = self.evaluator.channel_gain(device_id, origin) ** 2
-                backhaul_weight = sum(
+                backhaul_hops = sum(
                     self.evaluator.wired_weight(origin, server_id)
                     for server_id in covered_by_server
                 )
                 incompatibility = self._cfrg_selected_incompatibility(device_id, selected)
-                index = (
-                    coverage_gain * channel_quality
-                    / ((1.0 + backhaul_weight) * (1.0 + incompatibility))
+                channel_quality = self.evaluator.channel_gain(device_id, origin) ** 2
+                denominator = (
+                    1.0
+                    + self.config.c_bw * singleton_bandwidth
+                    + self.config.c_fwd * backhaul_hops
+                ) * (1.0 + incompatibility)
+                selection_index = self._updated_safe_ratio(
+                    coverage_gain * channel_quality,
+                    denominator,
                 )
                 candidates.append(
-                    (
-                        index,
-                        coverage_gain,
-                        channel_quality,
-                        -backhaul_weight,
-                        -incompatibility,
-                        device_id,
-                        origin,
-                        covered_by_server,
-                        backhaul_weight,
-                        incompatibility,
-                    )
+                    {
+                        "device": device_id,
+                        "origin": origin,
+                        "covered_by_server": covered_by_server,
+                        "coverage_gain": coverage_gain,
+                        "channel_quality": channel_quality,
+                        "singleton_bandwidth": singleton_bandwidth,
+                        "backhaul_hops": backhaul_hops,
+                        "incompatibility": incompatibility,
+                        "selection_index": selection_index,
+                    }
                 )
 
             if not candidates:
                 break
-            best = max(candidates, key=lambda item: item[:6])
-            (
-                index,
-                coverage_gain,
-                channel_quality,
-                _,
-                _,
-                device_id,
-                origin,
-                covered_by_server,
-                backhaul_weight,
-                incompatibility,
-            ) = best
+            best = max(
+                candidates,
+                key=lambda item: (
+                    item["selection_index"],
+                    item["coverage_gain"],
+                    item["channel_quality"],
+                    -item["backhaul_hops"],
+                    self._id_sort_key(item["device"]),
+                ),
+            )
+            device_id = best["device"]
             selected.append(device_id)
             newly_owned = []
-            for server_id in sorted(covered_by_server):
-                for feature in sorted(covered_by_server[server_id]):
-                    pair = (server_id, feature)
-                    if pair not in ownership:
-                        ownership[pair] = device_id
-                        remaining[server_id].discard(feature)
-                        newly_owned.append([server_id, feature])
+            for server_id in sorted(best["covered_by_server"]):
+                for feature in sorted(best["covered_by_server"][server_id]):
+                    demand = (server_id, feature)
+                    if demand in ownership:
+                        continue
+                    ownership[demand] = device_id
+                    remaining[server_id].discard(feature)
+                    newly_owned.append([server_id, feature])
+            coverage_iteration += 1
             report.append(
                 {
-                    "iteration": len(selected),
+                    "stage": "coverage",
+                    "iteration": coverage_iteration,
                     "device": device_id,
-                    "origin_candidate": origin,
-                    "coverage_gain": coverage_gain,
-                    "channel_quality": channel_quality,
-                    "backhaul_weight": backhaul_weight,
-                    "incompatibility": incompatibility,
-                    "selection_index": index,
+                    "origin_candidate": best["origin"],
+                    "coverage_gain": best["coverage_gain"],
+                    "channel_quality": best["channel_quality"],
+                    "singleton_bandwidth": best["singleton_bandwidth"],
+                    "backhaul_hops": best["backhaul_hops"],
+                    "incompatibility": self._updated_json_number(best["incompatibility"]),
+                    "selection_index": best["selection_index"],
                     "newly_owned_demands": newly_owned,
                 }
             )
+
+        # Stage 2 is meaningful only after Stage 1 has established coverage.
+        if not any(remaining.values()):
+            self._updated_localize_ownership(selected, ownership, report)
+
+        # Only IoTs that no longer own any destination demand are pruned.
+        active_owners = set(ownership.values())
+        pruned = [device_id for device_id in selected if device_id not in active_owners]
+        if pruned:
+            selected[:] = [device_id for device_id in selected if device_id in active_owners]
+            report.append(
+                {
+                    "stage": "pruning",
+                    "removed_devices": pruned,
+                    "rule": "empty_destination_set_only",
+                }
+            )
+
         return selected, ownership, remaining, report
+
+    def _updated_localize_ownership(
+        self,
+        selected: list[DeviceId],
+        ownership: Dict[Demand, DeviceId],
+        report: list[dict[str, Any]],
+    ) -> None:
+        iteration = 0
+        epsilon = 1e-12
+        while True:
+            current_hops = self._updated_total_backhaul_hops(ownership)
+            trials: list[dict[str, Any]] = []
+            for device_id in self.devices:
+                if device_id in selected:
+                    continue
+                origin = self._updated_best_origin(device_id)
+                if origin is None:
+                    continue
+                local_demands = {
+                    demand
+                    for demand in ownership
+                    if demand[0] == origin
+                    and demand[1] in self.devices[device_id].features
+                    and ownership[demand] != device_id
+                }
+                if not local_demands:
+                    continue
+                trial_ownership = dict(ownership)
+                for demand in local_demands:
+                    trial_ownership[demand] = device_id
+                trial_hops = self._updated_total_backhaul_hops(trial_ownership)
+                hop_reduction = max(0.0, current_hops - trial_hops)
+                if hop_reduction <= epsilon:
+                    continue
+                singleton_bandwidth = self._updated_singleton_bandwidth(
+                    device_id,
+                    origin,
+                    {feature for _, feature in local_demands},
+                )
+                incompatibility = self._cfrg_selected_incompatibility(device_id, selected)
+                trials.append(
+                    {
+                        "device": device_id,
+                        "origin": origin,
+                        "local_demands": local_demands,
+                        "trial_ownership": trial_ownership,
+                        "hop_reduction": hop_reduction,
+                        "trial_hops": trial_hops,
+                        "singleton_bandwidth": singleton_bandwidth,
+                        "bandwidth_cost": self.config.c_bw * singleton_bandwidth,
+                        "incompatibility": incompatibility,
+                    }
+                )
+
+            if not trials:
+                break
+
+            hop_scale = max(
+                current_hops,
+                max(item["hop_reduction"] for item in trials),
+                epsilon,
+            )
+            finite_bandwidth_costs = [
+                item["bandwidth_cost"]
+                for item in trials
+                if math.isfinite(item["bandwidth_cost"])
+            ]
+            bandwidth_scale = max(finite_bandwidth_costs, default=epsilon)
+            finite_incompatibilities = [
+                item["incompatibility"]
+                for item in trials
+                if math.isfinite(item["incompatibility"])
+            ]
+            incompatibility_scale = max(finite_incompatibilities, default=1.0)
+            if incompatibility_scale <= epsilon:
+                incompatibility_scale = 1.0
+
+            for item in trials:
+                normalized_hops = item["hop_reduction"] / hop_scale
+                normalized_bandwidth = item["bandwidth_cost"] / max(
+                    bandwidth_scale,
+                    epsilon,
+                )
+                normalized_incompatibility = (
+                    item["incompatibility"] / incompatibility_scale
+                    if math.isfinite(item["incompatibility"])
+                    else float("inf")
+                )
+                denominator = (
+                    normalized_bandwidth * (1.0 + normalized_incompatibility)
+                    + epsilon
+                )
+                item["normalized_hop_reduction"] = normalized_hops
+                item["normalized_bandwidth_cost"] = normalized_bandwidth
+                item["normalized_incompatibility"] = normalized_incompatibility
+                item["localization_index"] = self._updated_safe_ratio(
+                    normalized_hops,
+                    denominator,
+                )
+
+            best = max(
+                trials,
+                key=lambda item: (
+                    item["localization_index"],
+                    item["hop_reduction"],
+                    -item["bandwidth_cost"],
+                    self._id_sort_key(item["device"]),
+                ),
+            )
+            if best["localization_index"] <= 1.0:
+                report.append(
+                    {
+                        "stage": "localization_stop",
+                        "reason": "best_index_not_greater_than_one",
+                        "best_device": best["device"],
+                        "best_localization_index": best["localization_index"],
+                    }
+                )
+                break
+
+            ownership.clear()
+            ownership.update(best["trial_ownership"])
+            selected.append(best["device"])
+            iteration += 1
+            report.append(
+                {
+                    "stage": "localization",
+                    "iteration": iteration,
+                    "device": best["device"],
+                    "origin_candidate": best["origin"],
+                    "reassigned_demands": [
+                        [server_id, feature]
+                        for server_id, feature in sorted(best["local_demands"])
+                    ],
+                    "hop_reduction": best["hop_reduction"],
+                    "hops_after": best["trial_hops"],
+                    "singleton_bandwidth": best["singleton_bandwidth"],
+                    "bandwidth_cost": best["bandwidth_cost"],
+                    "incompatibility": self._updated_json_number(best["incompatibility"]),
+                    "normalized_hop_reduction": best["normalized_hop_reduction"],
+                    "normalized_bandwidth_cost": best["normalized_bandwidth_cost"],
+                    "normalized_incompatibility": self._updated_json_number(
+                        best["normalized_incompatibility"]
+                    ),
+                    "localization_index": best["localization_index"],
+                }
+            )
 
     def _cfrg_reachable_servers(self, device_id: DeviceId) -> Set[ServerId]:
         device = self.devices[device_id]
@@ -335,7 +518,71 @@ class Phase2GroupingBackhaulMixin:
             for value in [self._cfrg_pair_dissimilarity(device_id, other_id)[0]]
             if value is not None
         ]
-        return min(values) if values else 0.0
+        return min(values) if values else float("inf")
+
+    def _updated_best_origin(self, device_id: DeviceId) -> ServerId | None:
+        reachable = self._cfrg_reachable_servers(device_id)
+        if not reachable:
+            return None
+        return max(
+            reachable,
+            key=lambda server_id: (
+                self.evaluator.channel_gain(device_id, server_id) ** 2,
+                server_id,
+            ),
+        )
+
+    def _updated_singleton_bandwidth(
+        self,
+        device_id: DeviceId,
+        origin: ServerId,
+        required_features: Set[str],
+    ) -> float:
+        group = self._make_group(
+            origin,
+            "updated_selection_candidate",
+            (device_id,),
+            required_features,
+        )
+        try:
+            return self.evaluator.derive_group_bandwidth_for_budget(
+                group,
+                self.evaluator.bandwidth_time_budget(),
+            )
+        except Exception:
+            return float("inf")
+
+    def _updated_total_backhaul_hops(
+        self,
+        ownership: Mapping[Demand, DeviceId],
+    ) -> float:
+        destinations: Dict[DeviceId, Set[ServerId]] = {}
+        for (server_id, _), device_id in ownership.items():
+            destinations.setdefault(device_id, set()).add(server_id)
+        total = 0.0
+        for device_id, servers in destinations.items():
+            origin = self._updated_best_origin(device_id)
+            if origin is None:
+                return float("inf")
+            total += sum(
+                self.evaluator.wired_weight(origin, server_id)
+                for server_id in servers
+            )
+        return total
+
+    @staticmethod
+    def _updated_safe_ratio(numerator: float, denominator: float) -> float:
+        if numerator <= 0.0 or math.isnan(numerator) or math.isnan(denominator):
+            return 0.0
+        if denominator <= 0.0:
+            return float("inf")
+        if math.isinf(denominator):
+            return 0.0
+        return numerator / denominator
+
+    @staticmethod
+    def _updated_json_number(value: float) -> float | None:
+        return value if math.isfinite(value) else None
 
     def _cfrg_pair_dissimilarity(
         self,

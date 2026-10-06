@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import math
 from pathlib import Path
 import sys
 from typing import Any, Dict, Mapping, Sequence, Set, Tuple
@@ -181,7 +182,20 @@ class Phase1ServerExpertSelectionMixin:
 
         self.phase1_report.update(
             {
-                "mode": "SCOPE",
+                "mode": "SCOPE-reuse-aware",
+                "placement_rule": (
+                    "H_bar * GPU * (1 + max_gating_cosine + dynamic_feature_reuse) "
+                    "/ ((epsilon + network_weight_sum) * (1 + dependency_hops))"
+                ),
+                "feature_reuse_source": (
+                    "dynamic union of required features from nodes already placed "
+                    "on the candidate server"
+                ),
+                "expert_reuse_source": (
+                    "maximum gating-vector cosine similarity to a node already "
+                    "placed on the candidate server, restricted to stored experts"
+                ),
+                "activation_rule": "unchanged original greedy memory fill",
                 "node_type_source": "SubtaskSpec.unique_id (fallback: subtask id)",
                 "occurrence_count": len(context["subtask_by_key"]),
                 "node_type_count": len(context["occurrences_by_type"]),
@@ -377,8 +391,18 @@ class Phase1ServerExpertSelectionMixin:
     ) -> tuple[ServerId, float, dict[str, float]]:
         candidates = []
         for server_id, server in self.servers.items():
+            placed_keys = [
+                key
+                for key, placed_server in placement.items()
+                if placed_server == server_id and key in context["subtask_by_key"]
+            ]
+            feature_demand: set[str] = set()
+            for key in placed_keys:
+                feature_demand.update(context["subtask_by_key"][key].required_features)
+
             expert_score = 0.0
-            coverage_score = 0.0
+            expert_reuse_score = 0.0
+            feature_reuse_score = 0.0
             forwarding_penalty = 0.0
             for key in deployment_unit:
                 subtask = context["subtask_by_key"][key]
@@ -387,11 +411,17 @@ class Phase1ServerExpertSelectionMixin:
                     for expert_id in server.stored_experts
                     if expert_id in self.experts
                 )
+                expert_reuse_score += self._maximum_gating_reuse(
+                    subtask,
+                    placed_keys,
+                    server.stored_experts,
+                    context,
+                )
                 required = set(subtask.required_features)
-                coverage_score += (
-                    len(required & context["server_features"][server_id]) / len(required)
+                feature_reuse_score += (
+                    len(required & feature_demand) / len(required)
                     if required
-                    else 1.0
+                    else 0.0
                 )
                 for neighbor in context["neighbors"].get(key, set()):
                     neighbor_server = placement.get(neighbor)
@@ -403,22 +433,28 @@ class Phase1ServerExpertSelectionMixin:
 
             unit_size = max(len(deployment_unit), 1)
             mean_expert_contribution = expert_score / unit_size
-            mean_feature_coverage = coverage_score / unit_size
+            mean_expert_reuse = expert_reuse_score / unit_size
+            mean_feature_reuse = feature_reuse_score / unit_size
             network_weight_sum = sum(
                 self.evaluator.wired_weight(server_id, other_server)
                 for other_server in self.servers
                 if other_server != server_id
             )
+            reuse_multiplier = 1.0 + mean_expert_reuse + mean_feature_reuse
             base_index = (
                 mean_expert_contribution
                 * max(float(server.gpu_memory), 0.0)
-                * mean_feature_coverage
+                * reuse_multiplier
                 / (1e-12 + network_weight_sum)
             )
             placement_index = base_index / (1.0 + forwarding_penalty)
             components = {
                 "mean_expert_contribution": mean_expert_contribution,
-                "mean_feature_coverage": mean_feature_coverage,
+                "mean_expert_reuse": mean_expert_reuse,
+                "mean_feature_reuse": mean_feature_reuse,
+                "reuse_multiplier": reuse_multiplier,
+                "placed_nodes_on_server": float(len(placed_keys)),
+                "dynamic_feature_demand_size": float(len(feature_demand)),
                 "gpu_memory": float(server.gpu_memory),
                 "network_weight_sum": network_weight_sum,
                 "base_index": base_index,
@@ -431,6 +467,60 @@ class Phase1ServerExpertSelectionMixin:
             key=lambda item: (item[0], item[1]),
         )
         return server_id, score, components
+
+    def _maximum_gating_reuse(
+        self,
+        subtask: SubtaskSpec,
+        placed_keys: Sequence[AssignmentKey],
+        stored_experts: set[str],
+        context: Mapping[str, Any],
+    ) -> float:
+        if not placed_keys:
+            return 0.0
+        indices = sorted(
+            {
+                self.experts[expert_id].index
+                for expert_id in stored_experts
+                if expert_id in self.experts and self.experts[expert_id].index >= 0
+            }
+        )
+        if not indices:
+            return 0.0
+        candidate = self._restricted_gating_vector(subtask, indices)
+        return max(
+            (
+                self._cosine_similarity(
+                    candidate,
+                    self._restricted_gating_vector(
+                        context["subtask_by_key"][placed_key],
+                        indices,
+                    ),
+                )
+                for placed_key in placed_keys
+            ),
+            default=0.0,
+        )
+
+    @staticmethod
+    def _restricted_gating_vector(
+        subtask: SubtaskSpec,
+        indices: Sequence[int],
+    ) -> tuple[float, ...]:
+        return tuple(
+            float(subtask.gating_weights[index])
+            if index < len(subtask.gating_weights)
+            else 0.0
+            for index in indices
+        )
+
+    @staticmethod
+    def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
+        dot = sum(a * b for a, b in zip(left, right))
+        left_norm = math.sqrt(sum(value * value for value in left))
+        right_norm = math.sqrt(sum(value * value for value in right))
+        if left_norm <= 0.0 or right_norm <= 0.0:
+            return 0.0
+        return max(0.0, min(1.0, dot / (left_norm * right_norm)))
 
     def _scope_placement_record(
         self,
