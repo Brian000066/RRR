@@ -37,9 +37,13 @@ class ExperimentConfig:
             single_sink=True,
         )
     )
+    # A shared-subtask ratio counts node instances whose unique ID is reused
+    # by another DAG. Each shared ID appears at most once in any one DAG.
+    shared_subtask_ratio: float = 0.4
+    shared_subtask_graph_count_range: tuple[int, int] = (2, 4)
 
     # Expert / task metadata settings.
-    num_experts: int = 8
+    num_experts: int = 16
     expert_memory_sizes_mb: tuple[float, ...] = (
         14.16,
         17.30,
@@ -49,6 +53,14 @@ class ExperimentConfig:
         29.88,
         33.03,
         36.18,
+        14.35350005,
+        31.98747879,
+        17.25680641,
+        34.72570471,
+        21.79071219,
+        18.28066402,
+        30.92318615,
+        34.76502272,
     )
     expert_memory_range: tuple[float, float] = (14.16, 36.18)
     expert_inference_times_ms: tuple[float, ...] = (
@@ -60,13 +72,21 @@ class ExperimentConfig:
         105.0,
         125.0,
         150.0,
+        92.85908316,
+        62.21828652,
+        126.85002314,
+        128.20651959,
+        89.01387579,
+        56.13957668,
+        112.22036417,
+        140.48559838,
     )
     reasoning_data_sizes_bytes: tuple[int, ...] = (256, 512, 1024)
     task_deadline_seconds_range: tuple[int, int] = (30, 120)
     num_iot_features: int = 100
     iot_features_per_node_range: tuple[int, int] = (2, 5)
-    gating_peak_count_range: tuple[int, int] = (2, 4)
-    gating_peak_mass_range: tuple[float, float] = (0.45, 0.60)
+    gating_peak_count_range: tuple[int, int] = (1, 1)
+    gating_peak_mass_range: tuple[float, float] = (0.75, 0.85)
 
     # Performance loss settings.
     loss_threshold: Optional[float] = None
@@ -85,7 +105,7 @@ class ExperimentConfig:
     run_our_similarity_aware_topk_backhaul: bool = True
 
     # Shared Top-K and grouping settings.
-    topk_k: int = 5
+    topk_k: int = 3
     topk_rank_by: str = "gating"
     location_aware_grouping_clusters_per_server: Optional[int] = None
     location_aware_grouping_kmeans_iterations: int = 20
@@ -112,10 +132,10 @@ class ExperimentConfig:
     cell_radius: float = 350.0
     num_antennas: int = 1
     iot_features_per_device_range: tuple[int, int] = (4, 8)
-    iot_server_feature_overlap_ratio: float = 0.20
+    iot_server_feature_overlap_ratio: float = 0.0
     iot_global_random_feature_fraction: float = 0.2
-    experts_per_server: int = 5
-    server_gpu_memory_range: tuple[float, float] = (130.0, 150.0)
+    experts_per_server: int = 4
+    server_gpu_memory_range: tuple[float, float] = (150.0, 168.24)
     # Paper: [10, 100] MB/s = [80, 800] Mbit/s.
     wired_rate_range: tuple[float, float] = (80e6, 800e6)
     wired_extra_link_probability: float = 0.05
@@ -140,7 +160,3 @@ class ExperimentConfig:
     c_act: float = 0.6
     c_fwd: float = 1.0
     c_inf: float = 0.06
-
-
-
-

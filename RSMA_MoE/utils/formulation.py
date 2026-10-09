@@ -12,6 +12,8 @@ TaskId = str
 SubtaskId = str
 GroupId = str
 AssignmentKey = Tuple[TaskId, SubtaskId]
+FeatureDemandKey = Tuple[TaskId, SubtaskId, ServerId, str]
+FeatureSource = Tuple[ServerId, GroupId]
 
 
 class InfeasibleBandwidthBudget(ValueError):
@@ -349,13 +351,28 @@ class FormulationEvaluator:
         assignments: Mapping[AssignmentKey, Sequence[Tuple[ServerId, ExpertId]]],
         groups: Sequence[GroupSpec],
         backhaul: Optional[Set[Tuple[ServerId, GroupId, ServerId]]] = None,
-        subtask_features: Optional[Mapping[AssignmentKey, Set[str]]] = None,
+        subtask_features: Optional[Mapping[Any, Set[str]]] = None,
+        feature_source_map: Optional[Mapping[FeatureDemandKey, FeatureSource]] = None,
     ) -> EvaluationResult:
         backhaul = backhaul or set()
-        groups = self.resolve_group_bandwidths(groups, assignments, backhaul)
+        groups = self.resolve_group_bandwidths(
+            groups,
+            assignments,
+            backhaul,
+            subtask_features=subtask_features,
+            feature_source_map=feature_source_map,
+        )
         common_rates, private_rates = self.compute_rates(groups)
         objective = self.compute_objective(assignments, groups, backhaul)
-        timing = self.compute_timing(assignments, groups, backhaul, common_rates, private_rates, subtask_features)
+        timing = self.compute_timing(
+            assignments,
+            groups,
+            backhaul,
+            common_rates,
+            private_rates,
+            subtask_features,
+            feature_source_map=feature_source_map,
+        )
         violations = self.check_constraints(assignments, groups, timing, common_rates, private_rates, subtask_features)
         return EvaluationResult(objective, timing, violations, common_rates, private_rates)
 
@@ -410,11 +427,19 @@ class FormulationEvaluator:
         groups: Sequence[GroupSpec],
         assignments: Optional[Mapping[AssignmentKey, Sequence[Tuple[ServerId, ExpertId]]]] = None,
         backhaul: Optional[Set[Tuple[ServerId, GroupId, ServerId]]] = None,
+        subtask_features: Optional[Mapping[Any, Set[str]]] = None,
+        feature_source_map: Optional[Mapping[FeatureDemandKey, FeatureSource]] = None,
     ) -> List[GroupSpec]:
         """Return groups with bandwidth derived from their own dependent subtasks."""
         if not self.config.derive_bandwidth:
             return list(groups)
-        budgets = self.group_bandwidth_budgets(groups, assignments or {}, backhaul or set())
+        budgets = self.group_bandwidth_budgets(
+            groups,
+            assignments or {},
+            backhaul or set(),
+            subtask_features=subtask_features,
+            feature_source_map=feature_source_map,
+        )
         return [
             replace(
                 group,
@@ -441,8 +466,16 @@ class FormulationEvaluator:
         groups: Sequence[GroupSpec],
         assignments: Mapping[AssignmentKey, Sequence[Tuple[ServerId, ExpertId]]],
         backhaul: Set[Tuple[ServerId, GroupId, ServerId]],
+        subtask_features: Optional[Mapping[Any, Set[str]]] = None,
+        feature_source_map: Optional[Mapping[FeatureDemandKey, FeatureSource]] = None,
     ) -> Dict[Tuple[ServerId, GroupId], float]:
-        dependencies = self.group_dependencies(groups, assignments, backhaul)
+        dependencies = self.group_dependencies(
+            groups,
+            assignments,
+            backhaul,
+            subtask_features=subtask_features,
+            feature_source_map=feature_source_map,
+        )
         latest_start = self.latest_subtask_start_times(assignments)
         fallback = self.bandwidth_time_budget()
         budgets: Dict[Tuple[ServerId, GroupId], float] = {}
@@ -480,6 +513,8 @@ class FormulationEvaluator:
         groups: Sequence[GroupSpec],
         assignments: Mapping[AssignmentKey, Sequence[Tuple[ServerId, ExpertId]]],
         backhaul: Set[Tuple[ServerId, GroupId, ServerId]],
+        subtask_features: Optional[Mapping[Any, Set[str]]] = None,
+        feature_source_map: Optional[Mapping[FeatureDemandKey, FeatureSource]] = None,
     ) -> Dict[Tuple[ServerId, GroupId], Set[Tuple[AssignmentKey, ServerId]]]:
         group_by_key = {(group.server_id, group.id): group for group in groups}
         feature_to_groups: Dict[str, List[GroupSpec]] = {}
@@ -497,8 +532,34 @@ class FormulationEvaluator:
             for subtask in task.subtasks:
                 key = (task.id, subtask.id)
                 for target_server in self.participating_servers(assignments, key):
-                    for feature in subtask.required_features:
-                        group = self.serving_group_for_feature(feature, target_server, feature_to_groups, backhaul)
+                    features = (
+                        set(subtask.required_features)
+                        if subtask_features is None
+                        else self.features_for_server(subtask_features, key, target_server)
+                    )
+                    for feature in features:
+                        if feature_source_map is None:
+                            group = self.serving_group_for_feature(
+                                feature,
+                                target_server,
+                                feature_to_groups,
+                                backhaul,
+                            )
+                        else:
+                            source = feature_source_map.get(
+                                (task.id, subtask.id, target_server, feature)
+                            )
+                            group = None if source is None else group_by_key.get(tuple(source))
+                            if group is not None:
+                                source_edge = (group.server_id, group.id, target_server)
+                                if (
+                                    feature not in self.group_payload_features(group)
+                                    or (
+                                        group.server_id != target_server
+                                        and source_edge not in backhaul
+                                    )
+                                ):
+                                    group = None
                         if group is not None:
                             dependencies.setdefault((group.server_id, group.id), set()).add(
                                 (key, target_server)
@@ -743,7 +804,8 @@ class FormulationEvaluator:
         backhaul: Set[Tuple[ServerId, GroupId, ServerId]],
         common_rates: Mapping[Tuple[ServerId, GroupId], float],
         private_rates: Mapping[Tuple[ServerId, GroupId, DeviceId], float],
-        subtask_features: Optional[Mapping[AssignmentKey, Set[str]]] = None,
+        subtask_features: Optional[Mapping[Any, Set[str]]] = None,
+        feature_source_map: Optional[Mapping[FeatureDemandKey, FeatureSource]] = None,
     ) -> TimingBreakdown:
         uplink: Dict[Tuple[ServerId, GroupId], float] = {}
         for group in groups:
@@ -764,7 +826,9 @@ class FormulationEvaluator:
         task_finish: Dict[TaskId, float] = {}
 
         group_by_device: Dict[DeviceId, GroupSpec] = {}
+        group_by_key: Dict[FeatureSource, GroupSpec] = {}
         for group in groups:
+            group_by_key[(group.server_id, group.id)] = group
             for device_id in group.devices:
                 group_by_device[device_id] = group
 
@@ -781,7 +845,17 @@ class FormulationEvaluator:
                     key = (task.id, sub.id)
                     for server_id in self.participating_servers(assignments, key):
                         server_features = None if subtask_features is None else self.features_for_server(subtask_features, key, server_id)
-                        feature_ready[(key, server_id)] = self.feature_ready_time(server_id, sub, group_by_device, uplink, backhaul, server_features)
+                        feature_ready[(key, server_id)] = self.feature_ready_time(
+                            server_id,
+                            sub,
+                            group_by_device,
+                            uplink,
+                            backhaul,
+                            server_features,
+                            assignment_key=key,
+                            group_by_key=group_by_key,
+                            feature_source_map=feature_source_map,
+                        )
                         pred_ready[(key, server_id)] = self.predecessor_ready_time(task, sub, server_id, assignments, finish)
                         start[(key, server_id)] = max(feature_ready[(key, server_id)], pred_ready[(key, server_id)])
                         finish[(key, server_id)] = start[(key, server_id)] + self.server_computation_time(key, server_id, assignments)
@@ -926,7 +1000,9 @@ class FormulationEvaluator:
             for device_id in group.devices:
                 private_rate = private_rates.get((group.server_id, group.id, device_id), 0.0)
                 aggregate_rate = common_rate + private_rate
-                if aggregate_rate < r_min:
+                # Ignore only floating-point round-off at the C7 boundary.
+                # Example: 399999.99999999994 should satisfy r_min=400000.0.
+                if aggregate_rate < r_min - 1e-6:
                     violations.append(
                         f"C7 min aggregate rate: device {device_id} in group {group_key} "
                         f"common={common_rate:.6g} + private={private_rate:.6g} "
@@ -1079,12 +1155,40 @@ class FormulationEvaluator:
         uplink: Mapping[Tuple[ServerId, GroupId], float],
         backhaul: Set[Tuple[ServerId, GroupId, ServerId]],
         required_features: Optional[Set[str]] = None,
+        *,
+        assignment_key: Optional[AssignmentKey] = None,
+        group_by_key: Optional[Mapping[FeatureSource, GroupSpec]] = None,
+        feature_source_map: Optional[Mapping[FeatureDemandKey, FeatureSource]] = None,
     ) -> float:
         features = set(subtask.required_features if required_features is None else required_features)
         if not features:
             return 0.0
         ready = 0.0
         for feature in features:
+            if feature_source_map is not None:
+                if assignment_key is None or group_by_key is None:
+                    return float("inf")
+                source = feature_source_map.get(
+                    (assignment_key[0], assignment_key[1], target_server, feature)
+                )
+                if source is None:
+                    return float("inf")
+                source = tuple(source)
+                group = group_by_key.get(source)
+                if group is None or feature not in self.group_payload_features(group):
+                    return float("inf")
+                arrival = uplink.get(source, float("inf"))
+                if group.server_id != target_server:
+                    edge = (group.server_id, group.id, target_server)
+                    if edge not in backhaul:
+                        return float("inf")
+                    arrival += self.group_feature_volume(group) / self.wired_rate(
+                        group.server_id,
+                        target_server,
+                    )
+                ready = max(ready, arrival)
+                continue
+
             best = float("inf")
             for device_id, device in self.devices.items():
                 if feature not in device.features or device_id not in group_by_device:

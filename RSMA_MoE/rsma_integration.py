@@ -464,7 +464,10 @@ def build_simple_servers(
 
     # First pass: keep as many experts available as possible. If there are
     # enough slots, every expert gets one copy before replicas are added.
-    for expert_offset, stored_expert_id in enumerate(expert_ids[:total_slots]):
+    # Shuffle the order so low-index experts are not tied to low-index servers.
+    deployment_order = list(expert_ids)
+    rng.shuffle(deployment_order)
+    for expert_offset, stored_expert_id in enumerate(deployment_order[:total_slots]):
         start_server = expert_offset % num_servers
         for hop in range(num_servers):
             server_index = (start_server + hop) % num_servers
@@ -472,26 +475,25 @@ def build_simple_servers(
                 place_expert(server_index, stored_expert_id)
                 break
 
-    # Second pass: fill remaining slots with random replicas. A server cannot
-    # store the same expert twice, but the same expert may appear on different servers.
-    max_replicas_per_expert = max(1, math.ceil(total_slots / len(expert_ids)) + 1)
+    # Second pass: fill remaining slots from the least-replicated experts.
+    # Randomness is used only to break ties, so deployment stays task-independent
+    # while replica counts differ by at most one for the configured 16x4 case.
     for server_index in rng.sample(range(num_servers), num_servers):
         while server_has_room(server_index):
             candidates = [
                 expert_id_value
                 for expert_id_value in expert_ids
                 if expert_id_value not in experts_by_server[server_index]
-                and replica_count[expert_id_value] < max_replicas_per_expert
             ]
             if not candidates:
-                candidates = [
-                    expert_id_value
-                    for expert_id_value in expert_ids
-                    if expert_id_value not in experts_by_server[server_index]
-                ]
-            if not candidates:
                 break
-            place_expert(server_index, rng.choice(candidates))
+            minimum_replica_count = min(replica_count[candidate] for candidate in candidates)
+            least_replicated = [
+                candidate
+                for candidate in candidates
+                if replica_count[candidate] == minimum_replica_count
+            ]
+            place_expert(server_index, rng.choice(least_replicated))
 
     gpu_min, gpu_max = normalize_float_range(gpu_memory_range, (gpu_memory, gpu_memory), "server_gpu_memory_range")
     rate_min, rate_max = wired_rate_range or (1e9, 1e9)

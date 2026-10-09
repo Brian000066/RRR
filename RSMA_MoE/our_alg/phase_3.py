@@ -13,7 +13,10 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from compared_method.hybrid_topk_location_aware_backhaul import ChainedPipelineResult
+from compared_method.hybrid_topk_location_aware_backhaul import (
+    ChainedBackhaulDecision,
+    ChainedPipelineResult,
+)
 from utils.formulation import (
     AssignmentKey,
     ExpertId,
@@ -109,7 +112,7 @@ class Phase3RefinementPruningMixin:
                         candidate_evaluations += 1
                         if trial_result is None:
                             continue
-                        if trial_result.total_cost >= best_result.total_cost - 1e-9:
+                        if trial_result.total_cost >= best_result.total_cost:
                             continue
                         item = (trial_result.total_cost, choice, trial_result)
                         if best_candidate is None or item[0] < best_candidate[0]:
@@ -167,7 +170,7 @@ class Phase3RefinementPruningMixin:
                 evaluated_servers.append(server_id)
                 if trial_result is None:
                     continue
-                if trial_result.total_cost >= best_result.total_cost - 1e-9:
+                if trial_result.total_cost >= best_result.total_cost:
                     continue
                 item = (trial_result.total_cost, server_id, trial_result)
                 if best_candidate is None or item[:2] < best_candidate[:2]:
@@ -486,36 +489,202 @@ class Phase3RefinementPruningMixin:
         result = self._far_evaluate_fixed_groups(assignments, selected_probability)
         return None if result is None or result.violations else result
 
-    def _far_evaluate_fixed_groups(self, assignments, selected_probability):
+    def _far_resolve_feature_sources(
+        self,
+        assignments,
+        groups,
+        preferred_source_map=None,
+        base_backhaul=None,
+        requested_subtask_features=None,
+        *,
+        allow_new_backhaul,
+        preserve_base_backhaul,
+    ):
+        """Resolve every task-feature demand to one concrete RSMA group."""
+        preferred = dict(preferred_source_map or {})
+        base_edges = set(base_backhaul or set())
+        resolved_edges = set(base_edges) if preserve_base_backhaul else set()
+        group_by_key = {
+            (group.server_id, group.id): group for group in groups
+        }
+        payload_by_key = {
+            key: self.evaluator.group_transmitted_features(group)
+            for key, group in group_by_key.items()
+        }
+        subtask_by_key = self._subtask_by_key()
+        source_map = {}
+        subtask_features: Dict[Tuple[str, str, str], Set[str]] = {}
+        missing = []
+
+        def source_is_usable(source, target_server, feature):
+            source = tuple(source)
+            group = group_by_key.get(source)
+            if group is None or feature not in payload_by_key[source]:
+                return False
+            if group.server_id == target_server:
+                return True
+            edge = (group.server_id, group.id, target_server)
+            return edge in base_edges or allow_new_backhaul
+
+        def source_order(source, target_server):
+            group = group_by_key[source]
+            if group.server_id == target_server:
+                return (0, 0.0, str(group.server_id), str(group.id))
+            edge = (group.server_id, group.id, target_server)
+            route_rank = 1 if edge in base_edges else 2
+            transfer_time = (
+                self.evaluator.group_feature_volume(group)
+                / self.evaluator.wired_rate(group.server_id, target_server)
+            )
+            return (
+                route_rank,
+                transfer_time,
+                str(group.server_id),
+                str(group.id),
+            )
+
+        for key in sorted(assignments):
+            subtask = subtask_by_key.get(key)
+            if subtask is None:
+                continue
+            for target_server in self.evaluator.participating_servers(
+                assignments,
+                key,
+            ):
+                feature_key = self._server_feature_key(key, target_server)
+                received = subtask_features.setdefault(feature_key, set())
+                requested_features = (
+                    set(subtask.required_features)
+                    if requested_subtask_features is None
+                    else self.evaluator.features_for_server(
+                        requested_subtask_features,
+                        key,
+                        target_server,
+                    )
+                )
+                for feature in sorted(requested_features):
+                    demand_key = (key[0], key[1], target_server, feature)
+                    source = preferred.get(demand_key)
+                    if source is not None and source_is_usable(
+                        source,
+                        target_server,
+                        feature,
+                    ):
+                        source = tuple(source)
+                    else:
+                        candidates = [
+                            source_key
+                            for source_key, payload in payload_by_key.items()
+                            if feature in payload
+                            and source_is_usable(
+                                source_key,
+                                target_server,
+                                feature,
+                            )
+                        ]
+                        source = (
+                            None
+                            if not candidates
+                            else min(
+                                candidates,
+                                key=lambda source_key: source_order(
+                                    source_key,
+                                    target_server,
+                                ),
+                            )
+                        )
+                    if source is None:
+                        missing.append(
+                            {
+                                "subtask": self._assignment_label(key),
+                                "server": target_server,
+                                "feature": feature,
+                            }
+                        )
+                        continue
+                    source_map[demand_key] = source
+                    received.add(feature)
+                    if source[0] != target_server:
+                        resolved_edges.add((source[0], source[1], target_server))
+
+        plan = []
+        for source_server, group_id, target_server in sorted(resolved_edges):
+            group = group_by_key.get((source_server, group_id))
+            if group is None:
+                missing.append(
+                    {
+                        "source_server": source_server,
+                        "group_id": group_id,
+                        "server": target_server,
+                        "feature": None,
+                    }
+                )
+                continue
+            plan.append(
+                ChainedBackhaulDecision(
+                    source_server=source_server,
+                    group_id=group_id,
+                    target_server=target_server,
+                    features=sorted(
+                        self.evaluator.group_transmitted_features(group)
+                    ),
+                )
+            )
+        return source_map, resolved_edges, plan, subtask_features, missing
+
+    def _far_evaluate_fixed_groups(
+        self,
+        assignments,
+        selected_probability,
+        source_result=None,
+    ):
         """Evaluate FAR placement while preserving Phase-II IoT group membership."""
+        self._far_last_fixed_group_rejection = None
         groups = [
             replace(group, bandwidth=0.0)
             for group in getattr(self, "_far_fixed_groups", ())
         ]
         if not groups:
+            self._far_last_fixed_group_rejection = {
+                "reason": "no fixed Phase-II groups are available",
+                "constraint_violations": [],
+            }
             return None
 
-        available_features: Set[str] = set()
-        for group in groups:
-            available_features.update(
-                self.evaluator.group_transmitted_features(group)
-            )
-
-        subtask_features: Dict[Tuple[str, str, str], Set[str]] = {}
-        for task in self.tasks.values():
-            for subtask in task.subtasks:
-                key = (task.id, subtask.id)
-                received = set(subtask.required_features) & available_features
-                if set(subtask.required_features) - received:
-                    return None
-                for server_id in self.evaluator.participating_servers(assignments, key):
-                    subtask_features[
-                        self._server_feature_key(key, server_id)
-                    ] = set(received)
+        preferred_source_map = (
+            None
+            if source_result is None
+            else source_result.feature_source_map
+        )
+        base_backhaul = (
+            set()
+            if source_result is None
+            else set(source_result.backhaul)
+        )
+        (
+            feature_source_map,
+            backhaul,
+            backhaul_plan,
+            subtask_features,
+            missing,
+        ) = self._far_resolve_feature_sources(
+            assignments,
+            groups,
+            preferred_source_map=preferred_source_map,
+            base_backhaul=base_backhaul,
+            allow_new_backhaul=True,
+            preserve_base_backhaul=source_result is not None,
+        )
+        if missing:
+            self._far_last_fixed_group_rejection = {
+                "reason": "required feature would be unavailable",
+                "missing_required_features": missing,
+                "constraint_violations": [],
+            }
+            return None
 
         data_req = self._subtask_data_requirements(assignments, subtask_features)
         feature_to_groups = self._feature_to_groups(groups)
-        backhaul, backhaul_plan = self._derive_backhaul(data_req, feature_to_groups)
         try:
             resolved_groups, budgets = self._derive_group_bandwidths(
                 groups,
@@ -523,8 +692,14 @@ class Phase3RefinementPruningMixin:
                 data_req,
                 backhaul,
                 feature_to_groups,
+                feature_source_map=feature_source_map,
             )
-        except InfeasibleBandwidthBudget:
+        except InfeasibleBandwidthBudget as exc:
+            self._far_last_fixed_group_rejection = {
+                "reason": "non-positive uplink time budget",
+                "detail": str(exc),
+                "constraint_violations": [],
+            }
             return None
 
         eval_config = replace(self.config, derive_bandwidth=False)
@@ -540,8 +715,13 @@ class Phase3RefinementPruningMixin:
             resolved_groups,
             backhaul,
             subtask_features=subtask_features,
+            feature_source_map=feature_source_map,
         )
         if evaluation.violations:
+            self._far_last_fixed_group_rejection = {
+                "reason": "full formulation constraint check failed",
+                "constraint_violations": list(evaluation.violations),
+            }
             return None
 
         (
@@ -589,6 +769,7 @@ class Phase3RefinementPruningMixin:
             backhaul=backhaul,
             violations=list(evaluation.violations),
             evaluation=evaluation,
+            feature_source_map=feature_source_map,
         )
 
     def _far_shared_occurrences(self, structures, context):
@@ -646,13 +827,84 @@ class Phase3RefinementPruningMixin:
             candidates.update(neighbor for _, neighbor in adjacency.get(server_id, []))
         return sorted(candidates), references
 
-    def _far_prune_redundancy(self, assignments, current_result):
-        """Jointly prune experts/backhauls with one acceptance rule.
+    def _far_server_task_node_counts(self, assignments):
+        """Count distinct assigned task nodes served by each server."""
+        counts: Dict[ServerId, int] = {
+            server_id: 0 for server_id in self.servers
+        }
+        for pairs in assignments.values():
+            for server_id in {pair[0] for pair in pairs}:
+                counts[server_id] = counts.get(server_id, 0) + 1
+        return counts
 
-        Every tentative removal is fully reevaluated. A removal is eligible
-        only when all constraints remain feasible and its resulting total cost
-        is strictly lower than the current total cost. Among all eligible
-        removals in one round, FAR commits the lowest-cost candidate.
+    @staticmethod
+    def _far_server_priority_ranks(server_ids, task_node_counts):
+        ordered = sorted(
+            set(server_ids),
+            key=lambda server_id: (
+                -task_node_counts.get(server_id, 0),
+                str(server_id),
+            ),
+        )
+        return {
+            server_id: rank
+            for rank, server_id in enumerate(ordered, start=1)
+        }
+
+    def _far_phase1_expert_candidates(self, assignments, task_node_counts):
+        """Return only Phase-I activated experts that remain in the state."""
+        activation_report = self.phase1_report.get("expert_activation", {})
+        existing_pairs = {
+            pair for pairs in assignments.values() for pair in pairs
+        }
+        server_ids = {server_id for server_id, _ in existing_pairs}
+        priority_ranks = self._far_server_priority_ranks(
+            server_ids,
+            task_node_counts,
+        )
+        candidates = []
+        for server_id in sorted(
+            server_ids,
+            key=lambda item: (priority_ranks[item], str(item)),
+        ):
+            server_report = activation_report.get(
+                server_id,
+                activation_report.get(str(server_id), {}),
+            )
+            activated = set(server_report.get("activated_experts", ()))
+            scores = server_report.get("activation_scores", {})
+            for pair in sorted(
+                (
+                    pair
+                    for pair in existing_pairs
+                    if pair[0] == server_id and pair[1] in activated
+                ),
+                key=lambda item: str(item[1]),
+            ):
+                raw_score = scores.get(pair[1], scores.get(str(pair[1])))
+                candidates.append(
+                    {
+                        "pair": pair,
+                        "server": server_id,
+                        "expert": pair[1],
+                        "phase1_activation_score": raw_score,
+                        "activation_score_order": (
+                            float(raw_score)
+                            if raw_score is not None
+                            else float("inf")
+                        ),
+                        "task_node_count": task_node_counts.get(server_id, 0),
+                        "server_priority_rank": priority_ranks[server_id],
+                    }
+                )
+        return candidates
+
+    def _far_prune_redundancy(self, assignments, current_result):
+        """Prune Phase-I experts first, then Phase-II backhaul tuples.
+
+        Both passes start from the server serving the most distinct task nodes.
+        Every tentative removal is fully reevaluated and is accepted only when
+        every constraint remains feasible and total cost strictly decreases.
         """
         result = current_result
         working = {key: list(value) for key, value in assignments.items()}
@@ -660,157 +912,295 @@ class Phase3RefinementPruningMixin:
         removed_backhaul: list[dict[str, Any]] = []
         accepted_removals: list[dict[str, Any]] = []
         evaluation_trace: list[dict[str, Any]] = []
-        round_index = 0
-
+        expert_round = 0
         while True:
-            round_index += 1
-            candidates = []
+            expert_round += 1
+            task_node_counts = self._far_server_task_node_counts(working)
+            expert_candidates = self._far_phase1_expert_candidates(
+                working,
+                task_node_counts,
+            )
+            accepted_candidate = None
 
-            for pair in sorted({pair for pairs in working.values() for pair in pairs}):
-                affected = [key for key, pairs in working.items() if pair in pairs]
-                trial = {
-                    key: [item for item in pairs if item != pair]
-                    for key, pairs in working.items()
-                }
-                trace = {
-                    "round": round_index,
-                    "type": "expert",
-                    "server": pair[0],
-                    "expert": pair[1],
-                    "affected_subtasks": [
-                        self._assignment_label(key) for key in affected
-                    ],
-                    "cost_before": result.total_cost,
-                }
-                if any(not trial[key] for key in affected):
-                    trace.update(
-                        {
-                            "feasible": False,
-                            "accepted": False,
-                            "reason": "an affected subtask would have no selected expert",
-                        }
+            for node_count in sorted(
+                {item["task_node_count"] for item in expert_candidates},
+                reverse=True,
+            ):
+                priority_bucket = [
+                    item
+                    for item in expert_candidates
+                    if item["task_node_count"] == node_count
+                ]
+                priority_bucket.sort(
+                    key=lambda item: (
+                        item["activation_score_order"],
+                        item["server_priority_rank"],
+                        str(item["expert"]),
                     )
-                    evaluation_trace.append(trace)
-                    continue
-                if not self._far_full_feature_loss_feasible(trial, affected):
-                    trace.update(
-                        {
-                            "feasible": False,
-                            "accepted": False,
-                            "reason": "performance-loss precheck failed",
-                        }
-                    )
-                    evaluation_trace.append(trace)
-                    continue
-                selected_probability, _ = self._selection_metadata_from_assignments(trial)
-                trial_result = self._far_evaluate_fixed_groups(
-                    trial,
-                    selected_probability,
                 )
-                feasible = trial_result is not None and not trial_result.violations
-                cost_after = None if trial_result is None else trial_result.total_cost
-                improving = (
-                    feasible
-                    and cost_after is not None
-                    and cost_after < result.total_cost - 1e-9
-                )
-                trace.update(
-                    {
-                        "feasible": feasible,
-                        "cost_after": cost_after,
-                        "improving": improving,
+                for item in priority_bucket:
+                    pair = item["pair"]
+                    affected = [
+                        key for key, pairs in working.items() if pair in pairs
+                    ]
+                    trial = {
+                        key: [value for value in pairs if value != pair]
+                        for key, pairs in working.items()
+                    }
+                    trace = {
+                        "stage": "expert_pruning",
+                        "round": expert_round,
+                        "type": "expert",
+                        "candidate_source": (
+                            "phase1.expert_activation.activated_experts"
+                        ),
+                        "server": item["server"],
+                        "expert": item["expert"],
+                        "server_task_node_counts": dict(task_node_counts),
+                        "server_task_node_count": item["task_node_count"],
+                        "server_priority_rank": item["server_priority_rank"],
+                        "phase1_activation_score": item[
+                            "phase1_activation_score"
+                        ],
+                        "affected_subtasks": [
+                            self._assignment_label(key) for key in affected
+                        ],
+                        "cost_before": result.total_cost,
+                        "cost_after": None,
+                        "constraint_violations": [],
+                        "feasible": False,
+                        "improving": False,
                         "accepted": False,
                     }
-                )
-                evaluation_trace.append(trace)
-                if improving:
-                    candidates.append(
-                        (
-                            float(cost_after),
-                            0,
-                            (pair[0], pair[1]),
-                            "expert",
-                            trial_result,
-                            trial,
-                            trace,
+                    if any(not trial[key] for key in affected):
+                        trace["rejection_reason"] = (
+                            "an affected subtask would have no selected expert"
                         )
-                    )
-
-            for edge in sorted(result.backhaul):
-                trial_result = self._far_remove_backhaul_tuple(result, edge)
-                feasible = trial_result is not None and not trial_result.violations
-                cost_after = None if trial_result is None else trial_result.total_cost
-                improving = (
-                    feasible
-                    and cost_after is not None
-                    and cost_after < result.total_cost - 1e-9
-                )
-                trace = {
-                    "round": round_index,
-                    "type": "backhaul",
-                    "origin": edge[0],
-                    "group": edge[1],
-                    "destination": edge[2],
-                    "cost_before": result.total_cost,
-                    "feasible": feasible,
-                    "cost_after": cost_after,
-                    "improving": improving,
-                    "accepted": False,
-                }
-                if trial_result is None and self._far_last_backhaul_rejection:
-                    trace.update(self._far_last_backhaul_rejection)
-                evaluation_trace.append(trace)
-                if improving:
-                    candidates.append(
-                        (
-                            float(cost_after),
-                            1,
-                            (edge[0], edge[1], edge[2]),
-                            "backhaul",
-                            trial_result,
-                            {
-                                key: list(value)
-                                for key, value in trial_result.subtask_assignment.items()
-                            },
-                            trace,
+                        evaluation_trace.append(trace)
+                        continue
+                    if not self._far_full_feature_loss_feasible(trial, affected):
+                        trace["rejection_reason"] = (
+                            "performance-loss precheck failed"
                         )
-                    )
+                        evaluation_trace.append(trace)
+                        continue
 
-            if not candidates:
+                    selected_probability, _ = (
+                        self._selection_metadata_from_assignments(trial)
+                    )
+                    trial_result = self._far_evaluate_fixed_groups(
+                        trial,
+                        selected_probability,
+                        source_result=result,
+                    )
+                    rejection = getattr(
+                        self,
+                        "_far_last_fixed_group_rejection",
+                        None,
+                    )
+                    if trial_result is None:
+                        if rejection:
+                            trace["constraint_violations"] = list(
+                                rejection.get("constraint_violations", [])
+                            )
+                            trace["rejection_reason"] = rejection.get(
+                                "reason",
+                                "full formulation evaluation failed",
+                            )
+                            for key, value in rejection.items():
+                                if key not in {"reason", "constraint_violations"}:
+                                    trace[key] = value
+                        else:
+                            trace["rejection_reason"] = (
+                                "full formulation evaluation failed"
+                            )
+                        evaluation_trace.append(trace)
+                        continue
+
+                    trace["cost_after"] = trial_result.total_cost
+                    trace["constraint_violations"] = list(
+                        trial_result.violations
+                    )
+                    trace["feasible"] = not trial_result.violations
+                    trace["improving"] = (
+                        trace["feasible"]
+                        and trial_result.total_cost < result.total_cost
+                    )
+                    if not trace["feasible"]:
+                        trace["rejection_reason"] = "constraint violations"
+                    elif not trace["improving"]:
+                        trace["rejection_reason"] = (
+                            "total cost did not strictly decrease"
+                        )
+                    evaluation_trace.append(trace)
+                    if trace["improving"]:
+                        accepted_candidate = (trial_result, trial, trace)
+                        break
+
+                if accepted_candidate is not None:
+                    break
+
+            if accepted_candidate is None:
                 break
 
-            (
-                _,
-                _,
-                _,
-                candidate_type,
-                accepted_result,
-                accepted_assignments,
-                accepted_trace,
-            ) = min(candidates, key=lambda item: item[:3])
+            accepted_result = accepted_candidate[0]
+            accepted_assignments = accepted_candidate[1]
+            accepted_trace = accepted_candidate[2]
             accepted_trace["accepted"] = True
+            accepted_trace.pop("rejection_reason", None)
             accepted_trace["saved_cost"] = (
                 result.total_cost - accepted_result.total_cost
             )
             accepted_removals.append(dict(accepted_trace))
-
-            stored_record = {
-                key: value
-                for key, value in accepted_trace.items()
-                if key not in {"round", "type", "feasible", "improving", "accepted"}
-            }
-            if candidate_type == "expert":
-                removed_experts.append(stored_record)
-            else:
-                removed_backhaul.append(stored_record)
-
+            removed_experts.append(dict(accepted_trace))
             result = accepted_result
             working = accepted_assignments
+
+        backhaul_round = 0
+        while True:
+            backhaul_round += 1
+            task_node_counts = self._far_server_task_node_counts(working)
+            edges = sorted(result.backhaul)
+            destination_servers = {edge[2] for edge in edges}
+            priority_ranks = self._far_server_priority_ranks(
+                destination_servers,
+                task_node_counts,
+            )
+            forwarding_cost_by_edge = {
+                edge: self.config.c_fwd
+                * self.evaluator.wired_weight(edge[0], edge[2])
+                for edge in edges
+            }
+            accepted_candidate = None
+
+            for node_count in sorted(
+                {
+                    task_node_counts.get(destination, 0)
+                    for destination in destination_servers
+                },
+                reverse=True,
+            ):
+                priority_bucket = [
+                    edge
+                    for edge in edges
+                    if task_node_counts.get(edge[2], 0) == node_count
+                ]
+                priority_bucket.sort(
+                    key=lambda edge: (
+                        -forwarding_cost_by_edge[edge],
+                        priority_ranks[edge[2]],
+                        str(edge[0]),
+                        str(edge[1]),
+                        str(edge[2]),
+                    )
+                )
+                for edge in priority_bucket:
+                    trial_result = self._far_remove_backhaul_tuple(result, edge)
+                    cost_after = (
+                        None if trial_result is None else trial_result.total_cost
+                    )
+                    violations = (
+                        [] if trial_result is None else list(trial_result.violations)
+                    )
+                    feasible = trial_result is not None and not violations
+                    improving = (
+                        feasible
+                        and cost_after is not None
+                        and cost_after < result.total_cost
+                    )
+                    trace = {
+                        "stage": "backhaul_pruning",
+                        "round": backhaul_round,
+                        "type": "backhaul",
+                        "candidate_source": "phase2.backhaul",
+                        "origin": edge[0],
+                        "group": edge[1],
+                        "destination": edge[2],
+                        "server_task_node_counts": dict(task_node_counts),
+                        "server_task_node_count": task_node_counts.get(
+                            edge[2], 0
+                        ),
+                        "server_priority_rank": priority_ranks[edge[2]],
+                        "forwarding_cost": forwarding_cost_by_edge[edge],
+                        "cost_before": result.total_cost,
+                        "cost_after": cost_after,
+                        "constraint_violations": violations,
+                        "feasible": feasible,
+                        "improving": improving,
+                        "accepted": False,
+                        "feature_source_updates": list(
+                            getattr(
+                                self,
+                                "_far_last_feature_source_updates",
+                                [],
+                            )
+                        ),
+                    }
+                    if trial_result is None:
+                        rejection = getattr(
+                            self,
+                            "_far_last_backhaul_rejection",
+                            None,
+                        )
+                        if rejection:
+                            trace.update(rejection)
+                            trace["rejection_reason"] = rejection.get(
+                                "reason",
+                                "backhaul evaluation failed",
+                            )
+                        else:
+                            trace["rejection_reason"] = (
+                                "backhaul evaluation failed"
+                            )
+                    elif violations:
+                        trace["rejection_reason"] = "constraint violations"
+                    elif not improving:
+                        trace["rejection_reason"] = (
+                            "total cost did not strictly decrease"
+                        )
+                    evaluation_trace.append(trace)
+                    if improving:
+                        accepted_candidate = (trial_result, trace)
+                        break
+
+                if accepted_candidate is not None:
+                    break
+
+            if accepted_candidate is None:
+                break
+
+            accepted_result = accepted_candidate[0]
+            accepted_trace = accepted_candidate[1]
+            accepted_trace["accepted"] = True
+            accepted_trace.pop("rejection_reason", None)
+            accepted_trace["saved_cost"] = (
+                result.total_cost - accepted_result.total_cost
+            )
+            accepted_removals.append(dict(accepted_trace))
+            removed_backhaul.append(dict(accepted_trace))
+            result = accepted_result
+            working = {
+                key: list(value)
+                for key, value in result.subtask_assignment.items()
+            }
 
         return result, working, {
             "acceptance_rule": (
                 "tentative removal -> update affected variables -> full feasibility "
                 "check -> accept iff total cost strictly decreases"
+            ),
+            "expert_candidate_source": (
+                "Phase-I expert_activation.activated_experts intersected with "
+                "the current assignments"
+            ),
+            "expert_priority_rule": (
+                "descending server task-node count; ascending Phase-I "
+                "activation score within the same count"
+            ),
+            "backhaul_candidate_source": "current Phase-II backhaul tuples",
+            "backhaul_priority_rule": (
+                "descending destination-server task-node count; descending "
+                "forwarding cost within the same count"
             ),
             "removed_experts": removed_experts,
             "removed_backhaul_tuples": removed_backhaul,
@@ -835,60 +1225,58 @@ class Phase3RefinementPruningMixin:
 
     def _far_remove_backhaul_tuple(self, result, edge):
         self._far_last_backhaul_rejection = None
+        self._far_last_feature_source_updates = []
         groups = self._groups_from_result(result)
         if not groups:
             return None
         remaining_backhaul = set(result.backhaul) - {edge}
-        remaining_plan = [
-            decision
-            for decision in result.backhaul_plan
-            if (
-                decision.source_server,
-                decision.group_id,
-                decision.target_server,
-            )
-            != edge
-        ]
-        available: Dict[ServerId, Set[str]] = defaultdict(set)
-        for group in groups:
-            available[group.server_id].update(
-                self.evaluator.group_transmitted_features(group)
-            )
-        for decision in remaining_plan:
-            available[decision.target_server].update(decision.features)
-
-        subtask_by_key = self._subtask_by_key()
-        subtask_features: Dict[Tuple[str, str, str], Set[str]] = {}
-        missing_required_features: list[dict[str, Any]] = []
-        for key in sorted(result.subtask_assignment):
-            subtask = subtask_by_key.get(key)
-            if subtask is None:
-                continue
-            required = set(subtask.required_features)
-            for server_id in self.evaluator.participating_servers(
-                result.subtask_assignment,
-                key,
-            ):
-                missing = required - available.get(server_id, set())
-                if missing:
-                    missing_required_features.append(
-                        {
-                            "subtask": self._assignment_label(key),
-                            "server": server_id,
-                            "missing_features": sorted(missing),
-                        }
-                    )
-                    continue
-                subtask_features[
-                    self._server_feature_key(key, server_id)
-                ] = set(required)
-
+        (
+            feature_source_map,
+            resolved_backhaul,
+            remaining_plan,
+            subtask_features,
+            missing_required_features,
+        ) = self._far_resolve_feature_sources(
+            result.subtask_assignment,
+            groups,
+            preferred_source_map=result.feature_source_map,
+            base_backhaul=remaining_backhaul,
+            allow_new_backhaul=False,
+            preserve_base_backhaul=True,
+        )
         if missing_required_features:
             self._far_last_backhaul_rejection = {
                 "reason": "required feature would become unreachable",
                 "missing_required_features": missing_required_features,
             }
             return None
+
+        def serialized_source(source):
+            if source is None:
+                return None
+            return {
+                "source_server": source[0],
+                "group_id": source[1],
+            }
+
+        changed_sources = []
+        source_keys = set(result.feature_source_map) | set(feature_source_map)
+        for demand_key in sorted(source_keys):
+            old_source = result.feature_source_map.get(demand_key)
+            new_source = feature_source_map.get(demand_key)
+            if old_source == new_source:
+                continue
+            changed_sources.append(
+                {
+                    "demand": (
+                        f"{demand_key[0]}:{demand_key[1]}:"
+                        f"{demand_key[2]}:{demand_key[3]}"
+                    ),
+                    "before": serialized_source(old_source),
+                    "after": serialized_source(new_source),
+                }
+            )
+        self._far_last_feature_source_updates = changed_sources
 
         data_req = self._subtask_data_requirements(
             result.subtask_assignment, subtask_features
@@ -899,8 +1287,9 @@ class Phase3RefinementPruningMixin:
                 groups,
                 result.subtask_assignment,
                 data_req,
-                remaining_backhaul,
+                resolved_backhaul,
                 feature_to_groups,
+                feature_source_map=feature_source_map,
             )
         except InfeasibleBandwidthBudget as exc:
             self._far_last_backhaul_rejection = {
@@ -919,8 +1308,9 @@ class Phase3RefinementPruningMixin:
         evaluation = evaluator.evaluate(
             result.subtask_assignment,
             resolved_groups,
-            remaining_backhaul,
+            resolved_backhaul,
             subtask_features=subtask_features,
+            feature_source_map=feature_source_map,
         )
         _, _, required_probability, reconstruction_loss, performance_loss = (
             self._recompute_loss_metadata(
@@ -958,9 +1348,10 @@ class Phase3RefinementPruningMixin:
             bandwidth_cost=evaluation.objective.bandwidth_cost,
             forwarding_cost=evaluation.objective.forwarding_cost,
             inference_cost=evaluation.objective.inference_cost,
-            backhaul=remaining_backhaul,
+            backhaul=resolved_backhaul,
             violations=list(evaluation.violations),
             evaluation=evaluation,
+            feature_source_map=feature_source_map,
         )
 
     def _legacy_phase3_refine(
@@ -996,6 +1387,7 @@ class Phase3RefinementPruningMixin:
                     trial_result = self._far_evaluate_fixed_groups(
                         trial_assignments,
                         selected_probability,
+                        source_result=best_result,
                     )
                     candidate_evaluations += 1
                     if trial_result is None or trial_result.violations:
@@ -1003,7 +1395,7 @@ class Phase3RefinementPruningMixin:
                     bandwidth_limit = best_result.bandwidth_cost * (1.0 + bandwidth_tolerance)
                     if trial_result.bandwidth_cost > bandwidth_limit + 1e-9:
                         continue
-                    if trial_result.total_cost >= best_result.total_cost - 1e-9:
+                    if trial_result.total_cost >= best_result.total_cost:
                         continue
                     candidate = (trial_result.total_cost, move, trial_result)
                     if best_candidate is None or candidate[0] < best_candidate[0]:
@@ -1065,10 +1457,38 @@ class Phase3RefinementPruningMixin:
             groups,
             subtask_features,
         )
+        (
+            feature_source_map,
+            backhaul,
+            plan,
+            pruned_features,
+            missing,
+        ) = self._far_resolve_feature_sources(
+            result.subtask_assignment,
+            pruned_groups,
+            preferred_source_map=result.feature_source_map,
+            base_backhaul=result.backhaul,
+            requested_subtask_features=pruned_features,
+            allow_new_backhaul=True,
+            preserve_base_backhaul=False,
+        )
+        if missing:
+            self.post_pruning_report.update(
+                {
+                    "enabled": True,
+                    "mode": "offline_final_group_pruning",
+                    "reverted": True,
+                    "cost_before": round(result.total_cost, 6),
+                    "cost_after": round(result.total_cost, 6),
+                    "note": "Pruned candidate has unresolved feature sources.",
+                    "missing_required_features": missing,
+                }
+            )
+            setattr(result, "post_pruning_report", self.post_pruning_report)
+            return result
         data_req = self._subtask_data_requirements(result.subtask_assignment, pruned_features)
         server_features = self._server_required_features(data_req)
         feature_to_groups = self._feature_to_groups(pruned_groups)
-        backhaul, plan = self._derive_backhaul(data_req, feature_to_groups)
         try:
             resolved_groups, budgets = self._derive_group_bandwidths(
                 pruned_groups,
@@ -1076,6 +1496,7 @@ class Phase3RefinementPruningMixin:
                 data_req,
                 backhaul,
                 feature_to_groups,
+                feature_source_map=feature_source_map,
             )
         except InfeasibleBandwidthBudget:
             self.post_pruning_report.update(
@@ -1097,6 +1518,7 @@ class Phase3RefinementPruningMixin:
             resolved_groups,
             backhaul,
             subtask_features=pruned_features,
+            feature_source_map=feature_source_map,
         )
         if evaluation.violations or evaluation.objective.total_cost > result.total_cost + 1e-9:
             self.post_pruning_report.update(
@@ -1134,6 +1556,7 @@ class Phase3RefinementPruningMixin:
             backhaul=backhaul,
             violations=list(evaluation.violations),
             evaluation=evaluation,
+            feature_source_map=feature_source_map,
         )
         setattr(pruned_result, "phase3_report", self.phase3_report)
         setattr(pruned_result, "post_pruning_report", self.post_pruning_report)
@@ -1452,9 +1875,23 @@ class Phase3RefinementPruningMixin:
         groups: Sequence[GroupSpec],
         subtask_features: Mapping[Tuple[str, str, str], Set[str]],
     ):
-        data_req = self._subtask_data_requirements(assignments, subtask_features)
+        (
+            feature_source_map,
+            backhaul,
+            _,
+            resolved_features,
+            missing,
+        ) = self._far_resolve_feature_sources(
+            assignments,
+            groups,
+            requested_subtask_features=subtask_features,
+            allow_new_backhaul=True,
+            preserve_base_backhaul=False,
+        )
+        if missing:
+            return None
+        data_req = self._subtask_data_requirements(assignments, resolved_features)
         feature_to_groups = self._feature_to_groups(groups)
-        backhaul, _ = self._derive_backhaul(data_req, feature_to_groups)
         try:
             resolved_groups, _ = self._derive_group_bandwidths(
                 groups,
@@ -1462,12 +1899,19 @@ class Phase3RefinementPruningMixin:
                 data_req,
                 backhaul,
                 feature_to_groups,
+                feature_source_map=feature_source_map,
             )
         except InfeasibleBandwidthBudget:
             return None
         eval_config = replace(self.config, derive_bandwidth=False)
         evaluator = FormulationEvaluator(self.servers, self.devices, self.experts, self.tasks, eval_config)
-        return evaluator.evaluate(assignments, resolved_groups, backhaul, subtask_features=subtask_features)
+        return evaluator.evaluate(
+            assignments,
+            resolved_groups,
+            backhaul,
+            subtask_features=resolved_features,
+            feature_source_map=feature_source_map,
+        )
 
     def _group_prune_priority(
         self,

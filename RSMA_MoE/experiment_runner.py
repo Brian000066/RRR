@@ -75,6 +75,8 @@ def generate_task_graphs(config: ExperimentConfig, seeds: RunSeeds, verbose: boo
         gating_peak_mass_range=config.gating_peak_mass_range,
         num_calibration_samples=config.num_calibration_samples,
         calibration_loss_range=config.calibration_loss_range,
+        shared_subtask_ratio=config.shared_subtask_ratio,
+        shared_subtask_graph_count_range=config.shared_subtask_graph_count_range,
         verbose=verbose,
         export_artifacts=export_artifacts,
     )
@@ -294,7 +296,7 @@ def print_method_result(method_name: str, result_path, result: Any, config: Expe
     )
     print_diagnostics(result, config)
     print(f"{method_name} violations: {len(result.violations)}")
-    if method_name == "JRGEP" and graphs is not None:
+    if method_name == "JRGSP" and graphs is not None:
         print_node_loss_summary(result, config, graphs)
 
 
@@ -340,7 +342,7 @@ METHOD_DISPLAY_NAMES = {
     "hybrid_topk_location_aware_backhaul": "Hybrid TopK+location_aware",
     "wdmoe_gssgd": "WDMoE+GSSGD",
     "wdmoe_location_aware": "WDMoE+location_aware",
-    "our_similarity_aware_topk_backhaul": "JRGEP",}
+    "our_similarity_aware_topk_backhaul": "JRGSP",}
 
 
 COST_COLORS = {
@@ -555,7 +557,7 @@ def run_enabled_methods(
             **our_algorithm_kwargs(config, graphs, seeds),
         )
         if print_details:
-            print_method_result("JRGEP", result_path, result, config, graphs)
+            print_method_result("JRGSP", result_path, result, config, graphs)
         results["our_similarity_aware_topk_backhaul"] = result
 
     if show_plot:
@@ -704,11 +706,6 @@ def run_experiment(config: ExperimentConfig | None = None) -> dict[str, Any]:
         filename=None,
     )
     return averages
-
-
-
-
-
 
 
 

@@ -35,6 +35,8 @@ from utils.formulation import (  # noqa: E402
 
 BackhaulEdge = Tuple[ServerId, GroupId, ServerId]
 GroupKey = Tuple[ServerId, GroupId]
+FeatureDemandKey = Tuple[str, str, ServerId, str]
+FeatureSource = Tuple[ServerId, GroupId]
 
 
 @dataclass
@@ -68,6 +70,9 @@ class ChainedPipelineResult:
     backhaul: Set[BackhaulEdge] = field(default_factory=set)
     violations: List[str] = field(default_factory=list)
     evaluation: Optional[EvaluationResult] = None
+    feature_source_map: Dict[FeatureDemandKey, FeatureSource] = field(
+        default_factory=dict
+    )
 
 
 class ChainedComparisonPipeline:
@@ -1124,8 +1129,23 @@ class ChainedComparisonPipeline:
             ),
         )
 
-    def _derive_group_bandwidths(self, groups, assignments, data_req, backhaul, feature_to_groups):
-        dependencies = self._group_dependencies(groups, assignments, data_req, backhaul, feature_to_groups)
+    def _derive_group_bandwidths(
+        self,
+        groups,
+        assignments,
+        data_req,
+        backhaul,
+        feature_to_groups,
+        feature_source_map=None,
+    ):
+        dependencies = self._group_dependencies(
+            groups,
+            assignments,
+            data_req,
+            backhaul,
+            feature_to_groups,
+            feature_source_map=feature_source_map,
+        )
         latest_start = self.evaluator.latest_subtask_start_times(assignments)
         budgets: Dict[GroupKey, float] = {}
         resolved: List[GroupSpec] = []
@@ -1136,13 +1156,50 @@ class ChainedComparisonPipeline:
             bandwidth = self.evaluator.derive_group_bandwidth_for_budget(group, budget)
             resolved.append(replace(group, bandwidth=bandwidth))
         return resolved, budgets
-    def _group_dependencies(self, groups, assignments, data_req, backhaul, feature_to_groups):
+    def _group_dependencies(
+        self,
+        groups,
+        assignments,
+        data_req,
+        backhaul,
+        feature_to_groups,
+        feature_source_map=None,
+    ):
         dependencies: Dict[GroupKey, Set[Tuple[AssignmentKey, ServerId]]] = {(g.server_id, g.id): set() for g in groups}
+        group_by_key = {(group.server_id, group.id): group for group in groups}
+        source_map = feature_source_map or {}
         for key in assignments:
             label = self._assignment_label(key)
             for target_server, features in data_req.get(label, {}).items():
                 for feature in features:
-                    group = self._serving_group_for_feature(feature, target_server, backhaul, feature_to_groups)
+                    demand_key = (key[0], key[1], target_server, feature)
+                    mapped_source = source_map.get(demand_key)
+                    if mapped_source is None:
+                        group = self._serving_group_for_feature(
+                            feature,
+                            target_server,
+                            backhaul,
+                            feature_to_groups,
+                        )
+                    else:
+                        source_key = tuple(mapped_source)
+                        group = group_by_key.get(source_key)
+                        if group is None:
+                            raise ValueError(
+                                f"Mapped feature source {source_key} does not exist "
+                                f"for demand {demand_key}"
+                            )
+                        if feature not in self.evaluator.group_transmitted_features(group):
+                            raise ValueError(
+                                f"Mapped feature source {source_key} does not transmit "
+                                f"{feature} for demand {demand_key}"
+                            )
+                        edge = (group.server_id, group.id, target_server)
+                        if group.server_id != target_server and edge not in backhaul:
+                            raise ValueError(
+                                f"Mapped feature source {source_key} cannot reach "
+                                f"{target_server} for demand {demand_key}"
+                            )
                     if group is not None:
                         dependencies.setdefault((group.server_id, group.id), set()).add((key, target_server))
         return dependencies
@@ -1338,6 +1395,21 @@ def result_to_jsonable(
         "group_required_features": result.group_required_features,
         "group_time_budgets": result.group_time_budgets,
         "rsma_group_bandwidths": result.rsma_group_bandwidths,
+        "feature_source_map": {
+            f"{task_id}:{subtask_id}:{target_server}:{feature}": {
+                "source_server": source_server,
+                "group_id": group_id,
+            }
+            for (
+                task_id,
+                subtask_id,
+                target_server,
+                feature,
+            ), (
+                source_server,
+                group_id,
+            ) in sorted(result.feature_source_map.items())
+        },
         "backhaul": [list(item) for item in sorted(result.backhaul)],
         "backhaul_plan": [decision.__dict__ for decision in result.backhaul_plan],
         "violations": result.violations,
@@ -1530,8 +1602,6 @@ def run_chained_pipeline(
             indent=2,
         )
     return result
-
-
 
 
 

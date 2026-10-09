@@ -60,6 +60,11 @@ class Phase2GroupingBackhaulMixin:
         groups, group_records, dp_report = self._cfrg_interval_groups(order, ownership)
         backhaul, backhaul_plan = self._cfrg_backhaul_plan(group_records)
         subtask_features = self._cfrg_subtask_features(assignments, ownership)
+        feature_source_map = self._cfrg_feature_source_map(
+            assignments,
+            ownership,
+            group_records,
+        )
 
         required_probability: Dict[str, float] = {}
         reconstruction_loss: Dict[str, float] = {}
@@ -102,6 +107,7 @@ class Phase2GroupingBackhaulMixin:
             data_req,
             backhaul,
             feature_to_groups,
+            feature_source_map=feature_source_map,
         )
         eval_config = replace(self.config, derive_bandwidth=False)
         evaluator = FormulationEvaluator(
@@ -116,6 +122,7 @@ class Phase2GroupingBackhaulMixin:
             resolved_groups,
             backhaul,
             subtask_features=subtask_features,
+            feature_source_map=feature_source_map,
         )
         violations = [*self.scheduler_violations, *local_violations, *evaluation.violations]
 
@@ -132,6 +139,21 @@ class Phase2GroupingBackhaulMixin:
                 "feature_ownership": {
                     f"{server_id}:{feature}": device_id
                     for (server_id, feature), device_id in sorted(ownership.items())
+                },
+                "feature_source_map": {
+                    f"{task_id}:{subtask_id}:{target_server}:{feature}": {
+                        "source_server": source_server,
+                        "group_id": group_id,
+                    }
+                    for (
+                        task_id,
+                        subtask_id,
+                        target_server,
+                        feature,
+                    ), (
+                        source_server,
+                        group_id,
+                    ) in sorted(feature_source_map.items())
                 },
                 "remaining_feature_deficits": {
                     server_id: sorted(features)
@@ -194,6 +216,7 @@ class Phase2GroupingBackhaulMixin:
             backhaul=backhaul,
             violations=violations,
             evaluation=evaluation,
+            feature_source_map=feature_source_map,
         )
 
     def _cfrg_feature_deficits(
@@ -955,3 +978,46 @@ class Phase2GroupingBackhaulMixin:
                     set(subtask.required_features) & owned_by_server.get(server_id, set())
                 )
         return subtask_features
+
+    def _cfrg_feature_source_map(
+        self,
+        assignments: Mapping[AssignmentKey, Sequence[Tuple[ServerId, str]]],
+        ownership: Mapping[Tuple[ServerId, str], DeviceId],
+        group_records: Sequence[Mapping[str, Any]],
+    ) -> Dict[Tuple[str, str, ServerId, str], Tuple[ServerId, str]]:
+        """Bind every CFRG feature demand to its selected IoT group."""
+        device_to_group: Dict[DeviceId, Tuple[ServerId, str]] = {}
+        for record in group_records:
+            source = (
+                str(record["origin_server"]),
+                str(record["group_id"]),
+            )
+            for device_id in record["members"]:
+                device_to_group[str(device_id)] = source
+
+        subtask_by_key = {
+            (task.id, subtask.id): subtask
+            for task in self.tasks.values()
+            for subtask in task.subtasks
+        }
+        source_map: Dict[
+            Tuple[str, str, ServerId, str],
+            Tuple[ServerId, str],
+        ] = {}
+        for key, pairs in assignments.items():
+            subtask = subtask_by_key.get(key)
+            if subtask is None:
+                continue
+            for target_server in {server_id for server_id, _ in pairs}:
+                for feature in sorted(subtask.required_features):
+                    owner = ownership.get((target_server, feature))
+                    if owner is None:
+                        continue
+                    source = device_to_group.get(owner)
+                    if source is None:
+                        raise ValueError(
+                            f"CFRG owner {owner} for {target_server}:{feature} "
+                            "does not belong to any selected group"
+                        )
+                    source_map[(key[0], key[1], target_server, feature)] = source
+        return source_map
